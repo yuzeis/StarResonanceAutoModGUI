@@ -149,42 +149,50 @@ struct LightweightSolution {
 };
 
 /// @brief 更加紧凑的模组解
-/// @details 用于中间计算, 将4个模组的索引打包进64位整数中
+/// @details 用于中间计算, 将模组索引打包存储:
+///          前 min(combo_size, 4) 个索引用 packed_indices (每格16bit)
+///          第5~10个索引存放在 extra_indices (支持combo_size最大10件)
 struct CompactSolution {
-    /// @brief 打包的模组索引
+    /// @brief 打包的前 min(combo_size, 4) 个模组索引
     uint64_t packed_indices;
-    
+
+    /// @brief 第5~10个模组索引 (combo_size>4时使用)
+    std::vector<uint16_t> extra_indices;
+
     /// @brief 分数
     int score;
-    
+
+    /// @brief 实际件数，用于正确解包索引（默认4，向后兼容）
+    int combo_size;
+
     /// @brief 默认构造函数
-    CompactSolution() : packed_indices(0), score(0) {}
-    
-    /// @brief 从数组构造
-    /// @param indices 模组索引数组
-    /// @param score 分数
-    CompactSolution(const std::array<uint16_t, 4>& indices, int score) : score(score) {
+    CompactSolution() : packed_indices(0), score(0), combo_size(4) {}
+
+    /// @brief 从数组构造（仅用于 combo_size=4 的老接口）
+    CompactSolution(const std::array<uint16_t, 4>& indices, int score)
+        : score(score), combo_size(4) {
         pack_indices_array(indices);
     }
-    
-    /// @brief 从数组打包索引
-    /// @param indices 模组索引数组
+
+    /// @brief 从数组打包索引（combo_size=4 的老接口）
     void pack_indices_array(const std::array<uint16_t, 4>& indices) {
         packed_indices = 0;
-        for (size_t i = 0; i < 4; ++i) {
+        for (size_t i = 0; i < 4; ++i)
             packed_indices |= (static_cast<uint64_t>(indices[i]) << (i * 16));
-        }
     }
-    
-    /// @brief 解包索引
-    /// @return 模组索引
+
+    /// @brief 解包所有模组索引（兼容任意 combo_size，长度 == combo_size）
+    /// @return 完整模组索引列表
     std::vector<size_t> unpack_indices_vector() const {
         std::vector<size_t> indices;
-        indices.reserve(4);
-        for (size_t i = 0; i < 4; ++i) {
+        size_t pack_n = static_cast<size_t>(std::min(combo_size, 4));
+        indices.reserve(static_cast<size_t>(combo_size));
+        for (size_t i = 0; i < pack_n; ++i) {
             uint16_t idx = static_cast<uint16_t>((packed_indices >> (i * 16)) & 0xFFFF);
             indices.push_back(static_cast<size_t>(idx));
         }
+        for (uint16_t ei : extra_indices)
+            indices.push_back(static_cast<size_t>(ei));
         return indices;
     }
     
@@ -249,27 +257,22 @@ public:
         const std::unordered_set<int>& target_attributes = {},
         const std::unordered_set<int>& exclude_attributes = {});
 
-    /// @brief 根据紧凑索引计算战斗力
-    /// @param packed_indices 打包的模组索引
+    /// @brief 根据紧凑索引计算战斗力（仅支持 combo_size <= 4，超过4件请用 CalculateCombatPowerByIndices）
+    /// @param packed_indices 打包的模组索引（每16bit一个，最多4个）
     /// @param modules 模组信息列表
     /// @param target_attributes 目标属性名称列表
     /// @param exclude_attributes 排除属性名称列表
+    /// @param combo_size 实际件数（<=4），默认4
     /// @return 返回战斗力数值
     static int CalculateCombatPowerByPackedIndices(
         uint64_t packed_indices,
         const std::vector<ModuleInfo>& modules,
         const std::unordered_set<int>& target_attributes = {},
-        const std::unordered_set<int>& exclude_attributes = {}
+        const std::unordered_set<int>& exclude_attributes = {},
+        int combo_size = 4
     );
 
-    /// @brief 处理组合范围
-    /// @param start_combination 起始组合编号
-    /// @param end_combination 结束组合编号
-    /// @param n 总模组数量
-    /// @param modules 模组信息列表
-    /// @param target_attributes 目标属性名称集合
-    /// @param exclude_attributes 排除属性名称集合
-    /// @return 返回简易解列表
+    /// @brief 处理组合范围（支持combo_size 1~10）
     static std::vector<CompactSolution> ProcessCombinationRange(
         size_t start_combination, 
         size_t end_combination, 
@@ -278,38 +281,29 @@ public:
         const std::unordered_set<int>& target_attributes = {},
         const std::unordered_set<int>& exclude_attributes = {},
         const std::unordered_map<int, int>& min_attr_sum_requirements = {},
-        int local_top_capacity = 0
+        int local_top_capacity = 0,
+        int combo_size = 4
     );
 
-    /// @brief 策略枚举算法
-    /// @param modules 模组信息列表
-    /// @param target_attributes 目标属性名称集合
-    /// @param exclude_attributes 排除属性名称集合
-    /// @param max_solutions 最大解决方案数量，默认为60
-    /// @param max_workers 最大工作线程数，默认为8
-    /// @return 返回模组解决方案列表
+    /// @brief 策略枚举算法（CPU多线程，支持combo_size 1~10）
     static std::vector<ModuleSolution> StrategyEnumeration(
         const std::vector<ModuleInfo>& modules,
         const std::unordered_set<int>& target_attributes = {},
         const std::unordered_set<int>& exclude_attributes = {},
         const std::unordered_map<int, int>& min_attr_sum_requirements = {},
         int max_solutions = 60,
-        int max_workers = 8);
+        int max_workers = 8,
+        int combo_size = 4);
 
-    /// @brief 策略枚举算法, CUDA
-    /// @param modules 模组信息列表
-    /// @param target_attributes 目标属性名称集合
-    /// @param exclude_attributes 排除属性名称集合
-    /// @param max_solutions 最大解决方案数量，默认为60
-    /// @param max_workers 最大工作线程数, GPU忽略, 保持接口统一
-    /// @return 返回模组解决方案列表
+    /// @brief 策略枚举算法（CUDA，支持combo_size 1~10）
     static std::vector<ModuleSolution> StrategyEnumerationCUDA(
         const std::vector<ModuleInfo>& modules,
         const std::unordered_set<int>& target_attributes = {},
         const std::unordered_set<int>& exclude_attributes = {},
         const std::unordered_map<int, int>& min_attr_sum_requirements = {},
         int max_solutions = 60,
-        int max_workers = 8);
+        int max_workers = 8,
+        int combo_size = 4);
 
     /// @brief 策略枚举算法, OpenCL
     /// @param modules 模组信息列表
@@ -318,28 +312,25 @@ public:
     /// @param max_solutions 最大解决方案数量，默认为60
     /// @param max_workers 最大工作线程数, GPU忽略, 保持接口统一
     /// @return 返回模组解决方案列表
+    /// @brief 策略枚举算法（OpenCL，支持combo_size 1~10）
     static std::vector<ModuleSolution> StrategyEnumerationOpenCL(
         const std::vector<ModuleInfo>& modules,
         const std::unordered_set<int>& target_attributes = {},
         const std::unordered_set<int>& exclude_attributes = {},
         const std::unordered_map<int, int>& min_attr_sum_requirements = {},
         int max_solutions = 60,
-        int max_workers = 8);
+        int max_workers = 8,
+        int combo_size = 4);
 
-    /// @brief 统一GPU入口：优先CUDA，其次OpenCL，不可用则回退CPU
-    /// @param modules 模组信息列表
-    /// @param target_attributes 目标属性名称集合
-    /// @param exclude_attributes 排除属性名称集合
-    /// @param max_solutions 最大解决方案数量，默认为60
-    /// @param max_workers 最大工作线程数, GPU忽略, 保持接口统一
-    /// @return 返回模组解决方案列表
+    /// @brief 统一GPU入口：优先CUDA，其次OpenCL，不可用则回退CPU（支持combo_size 1~10）
     static std::vector<ModuleSolution> StrategyEnumerationGPU(
         const std::vector<ModuleInfo>& modules,
         const std::unordered_set<int>& target_attributes = {},
         const std::unordered_set<int>& exclude_attributes = {},
         const std::unordered_map<int, int>& min_attr_sum_requirements = {},
         int max_solutions = 60,
-        int max_workers = 8);
+        int max_workers = 8,
+        int combo_size = 4);
 
     /// @brief 优化模组组合
     /// @param modules 模组信息列表
@@ -355,7 +346,8 @@ public:
         const std::unordered_set<int>& exclude_attributes = {},
         int max_solutions = 60,
         int max_attempts_multiplier = 20,
-        int local_search_iterations = 30);
+        int local_search_iterations = 30,
+        int combo_size = 4);
 
 private:
     /// @brief 贪心构造解决方案
@@ -366,7 +358,8 @@ private:
     static LightweightSolution GreedyConstructSolutionByIndices(
         const std::vector<ModuleInfo>& modules,
         const std::unordered_set<int>& target_attributes = {},
-        const std::unordered_set<int>& exclude_attributes = {});
+        const std::unordered_set<int>& exclude_attributes = {},
+        int combo_size = 4);
     
     /// @brief 局部搜索改进算法
     /// @param solution 初始解决方案

@@ -26,6 +26,7 @@ from cpp_extension.module_optimizer_cpp import (
     strategy_enumeration_gpu_cpp,
     strategy_enumeration_opencl_cpp,
     test_cuda,
+    test_opencl,
     optimize_modules_cpp
 )
 
@@ -57,12 +58,16 @@ class ModuleSolution:
 class ModuleOptimizer:
     """模组搭配优化器"""
     
-    def __init__(self, target_attributes: List[str] = None, exclude_attributes: List[str] = None, min_attr_sum_requirements: dict | None = None, lang: str = 'zh'):
+    def __init__(self, target_attributes: List[str] = None, exclude_attributes: List[str] = None,
+                 min_attr_sum_requirements: dict | None = None, lang: str = 'zh',
+                 combo_size: int = 4, compute_mode: str = 'cpu'):
         """初始化模组搭配优化器
         
         Args:
             target_attributes: 目标属性列表，用于优先筛选
             exclude_attributes: 排除属性列表, 用于权重为0
+            combo_size: 组合件数 (1~10，默认4)
+            compute_mode: 计算模式 ('cpu'/'cuda'/'opencl'，默认'cpu')
         """
         self.logger = _get_logger()
         self._result_log_file = None
@@ -70,6 +75,8 @@ class ModuleOptimizer:
         self.exclude_attributes = exclude_attributes or []
         self.min_attr_sum_requirements = min_attr_sum_requirements or {}
         self.lang = (lang or 'zh').lower()
+        self.combo_size = max(1, min(10, int(combo_size)))
+        self.compute_mode = (compute_mode or 'cpu').lower()
         
         self.local_search_iterations = 50  # 局部搜索迭代次数
         self.max_attempts = 20             # 贪心+局部搜索最大尝试次数
@@ -247,10 +254,10 @@ class ModuleOptimizer:
             ]
             self.logger.info(self._t(f"找到{len(filtered_modules)}个{category.value}类型模组", f"Found {len(filtered_modules)} {cat_disp} modules"))
         
-        if len(filtered_modules) < 4:
-            self.logger.warning(self._t(f"{category.value}类型模组数量不足4个, 无法形成完整搭配", f"Not enough {cat_disp} modules (<4) to form a combination"))
+        if len(filtered_modules) < self.combo_size:
+            self.logger.warning(self._t(f"{category.value}类型模组数量不足{self.combo_size}个, 无法形成完整搭配", f"Not enough {cat_disp} modules (<{self.combo_size}) to form a combination"))
             return []
-        
+
         # 筛选模组
         top_modules, candidate_modules = self._prefilter_modules(filtered_modules)
         greedy_solutions = []
@@ -331,12 +338,12 @@ class ModuleOptimizer:
             ]
             self.logger.info(self._t(f"找到{len(filtered_modules)}个{category.value}类型模组", f"Found {len(filtered_modules)} {cat_disp} modules"))
         
-        if len(filtered_modules) < 4:
-            self.logger.warning(self._t(f"{category.value}类型模组数量不足4个, 无法形成完整搭配", f"Not enough {cat_disp} modules (<4) to form a combination"))
+        if len(filtered_modules) < self.combo_size:
+            self.logger.warning(self._t(f"{category.value}类型模组数量不足{self.combo_size}个, 无法形成完整搭配", f"Not enough {cat_disp} modules (<{self.combo_size}) to form a combination"))
             return []
         
-        # 超过800/1000个根据总属性筛下
-        if self.check_cuda_availability():
+        # 根据当前计算模式决定预筛上限
+        if self.compute_mode in ('cuda', 'opencl'):
             if len(filtered_modules) > 1000:
                 filtered_modules = self._prefilter_modules_by_total_scores(filtered_modules, 1000)
                 self.logger.info(self._t(f"枚举数量超过1000, 进行筛选, 筛选后模组数量: {len(filtered_modules)}", f"Enumeration exceeds 1000, prefilter applied: {len(filtered_modules)} remain"))
@@ -361,52 +368,73 @@ class ModuleOptimizer:
         return result
     
     def _strategy_enumeration(self, modules: List[ModuleInfo]) -> List[ModuleSolution]:
-        """枚举
-        
-        Args:
-            modules: 模组列表
-            
-        Returns:
-            List[ModuleSolution]: 最优解列表
-        """
-        
+        """枚举（支持 combo_size 1~10，计算模式 cpu/cuda/opencl）"""
+
         cpp_modules = self._convert_to_cpp_modules(modules)
-        
-        # 将目标属性列表转换为集合
-        target_attributes_id = []
-        if self.target_attributes:
-            for attr_str in self.target_attributes:
-                aid = MODULE_ATTR_IDS.get(attr_str)
-                if aid is not None:
-                    target_attributes_id.append(aid)
-        target_attrs_set = set(target_attributes_id)
-        
-        # 将排除属性列表转换为集合
-        exclude_attributes_id = []
-        if self.exclude_attributes:
-            for attr_str in self.exclude_attributes:
-                exclude_attributes_id.append(MODULE_ATTR_IDS.get(attr_str))
-        exclude_attrs_set = set(exclude_attributes_id)
-        
-        min_attr_id_requirements: Dict[int, int] = {}
-        if self.min_attr_sum_requirements:
-            for name, val in self.min_attr_sum_requirements.items():
-                aid = MODULE_ATTR_IDS.get(name)
-                if aid is not None:
-                    min_attr_id_requirements[aid] = int(val)
 
-        cpp_solutions = strategy_enumeration_gpu_cpp(
-            cpp_modules,
-            target_attrs_set,
-            exclude_attrs_set,
-            min_attr_id_requirements,    
-            self.max_solutions,
-            self.get_cpu_count()
+        # 目标属性 ID 集合
+        target_attrs_set = set(
+            MODULE_ATTR_IDS[a] for a in self.target_attributes if a in MODULE_ATTR_IDS
         )
-        
-        result = self._convert_from_cpp_solutions(cpp_solutions)
+        # 排除属性 ID 集合
+        exclude_attrs_set = set(
+            MODULE_ATTR_IDS[a] for a in self.exclude_attributes if a in MODULE_ATTR_IDS
+        )
+        # 属性总和约束
+        min_attr_id_requirements: Dict[int, int] = {
+            MODULE_ATTR_IDS[name]: int(val)
+            for name, val in self.min_attr_sum_requirements.items()
+            if name in MODULE_ATTR_IDS
+        }
 
-        return result
+        k     = self.combo_size
+        mode  = self.compute_mode
+        n_mod = len(modules)
+
+        # OpenCL 后端已支持 combo_size 1~10，无需回退
+        if mode == 'opencl' and k > 10:
+            self.logger.warning(self._t(
+                f"OpenCL 后端最大支持10件组合，已自动回退到 CPU 枚举（combo_size={k}）",
+                f"OpenCL backend supports at most combo_size=10; falling back to CPU enumeration (combo_size={k})"
+            ))
+            mode = 'cpu'
+
+        self.logger.info(self._t(
+            f"枚举模式: {mode.upper()}，{k}件套，共{n_mod}个模组",
+            f"Enumeration: mode={mode.upper()}, combo_size={k}, modules={n_mod}"
+        ))
+
+        # ── 选择 C++ 后端 ────────────────────────────────────────────────────
+        if mode == 'cuda':
+            try:
+                cpp_solutions = strategy_enumeration_cuda_cpp(
+                    cpp_modules, target_attrs_set, exclude_attrs_set,
+                    min_attr_id_requirements, self.max_solutions,
+                    self.get_cpu_count(), k)
+                return self._convert_from_cpp_solutions(cpp_solutions)
+            except Exception as e:
+                self.logger.warning(self._t(
+                    f"CUDA枚举失败，回退CPU: {e}", f"CUDA failed, fallback to CPU: {e}"))
+                mode = 'cpu'
+
+        if mode == 'opencl':
+            try:
+                cpp_solutions = strategy_enumeration_opencl_cpp(
+                    cpp_modules, target_attrs_set, exclude_attrs_set,
+                    min_attr_id_requirements, self.max_solutions,
+                    self.get_cpu_count(), k)
+                return self._convert_from_cpp_solutions(cpp_solutions)
+            except Exception as e:
+                self.logger.warning(self._t(
+                    f"OpenCL枚举失败，回退CPU: {e}", f"OpenCL failed, fallback to CPU: {e}"))
+                mode = 'cpu'
+
+        # CPU（默认 / 回退）
+        cpp_solutions = strategy_enumeration_cpp(
+            cpp_modules, target_attrs_set, exclude_attrs_set,
+            min_attr_id_requirements, self.max_solutions,
+            self.get_cpu_count(), k)
+        return self._convert_from_cpp_solutions(cpp_solutions)
     
     def _strategy_greedy_local_search(self, modules: List[ModuleInfo]) -> List[ModuleSolution]:
         """贪心+局部搜索
@@ -418,6 +446,12 @@ class ModuleOptimizer:
             List[ModuleSolution]: 最优解列表
         """
         
+        if self.compute_mode != 'cpu':
+            self.logger.info(self._t(
+                f"贪心+局部搜索阶段当前使用CPU后端（compute_mode={self.compute_mode} 仅影响枚举阶段）",
+                f"Greedy/local-search phase currently uses CPU backend (compute_mode={self.compute_mode} affects enumeration only)"
+            ))
+
         cpp_modules = self._convert_to_cpp_modules(modules)
         
         boost_attr_names: Set[str] = set(self.target_attributes or [])
@@ -442,7 +476,9 @@ class ModuleOptimizer:
         exclude_attrs_set = set(exclude_attributes_id)
         
         cpp_solutions = optimize_modules_cpp(
-            cpp_modules, target_attrs_set, exclude_attrs_set, self.max_solutions, self.max_attempts, self.local_search_iterations)
+            cpp_modules, target_attrs_set, exclude_attrs_set,
+            self.max_solutions, self.max_attempts, self.local_search_iterations,
+            self.combo_size)
         
         result = self._convert_from_cpp_solutions(cpp_solutions)
         

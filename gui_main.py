@@ -1,3 +1,8 @@
+"""
+星痕共鸣模组筛选器 - GUI 界面
+基于 PySide6 的图形界面封装
+"""
+
 import sys
 import os
 import time
@@ -5,6 +10,8 @@ import math
 import threading
 import logging
 import random
+import json
+import base64
 from typing import List, Optional, Dict
 
 _PROJ_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -250,6 +257,15 @@ class AttrTagSelector(QScrollArea):
     def get_selected(self):
         return [a for a in self._attrs if a in self._selected]
 
+    def set_selected(self, attrs):
+        self.clear_all()
+        for a in attrs:
+            if a in self._btns:
+                self._selected.add(a)
+                self._btns[a].setChecked(True)
+                self._btns[a].setStyleSheet(self._style(True))
+        self.changed.emit()
+
     def clear_all(self):
         for a in list(self._selected):
             self._btns[a].setChecked(False)
@@ -377,6 +393,11 @@ class MinAttrSumWidget(QWidget):
     def get_constraints(self) -> Dict[str, int]:
         return dict(self._constraints)
 
+    def set_constraints(self, d: Dict[str, int]):
+        self._constraints = {k: int(v) for k, v in d.items()}
+        self._refresh_tags()
+        self.changed.emit()
+
     def clear_all(self):
         self._constraints.clear()
         self._refresh_tags()
@@ -446,9 +467,10 @@ class BenchmarkDialog(QDialog):
     _sig_speed = Signal(str, float)
     _sig_done  = Signal()
 
-    def __init__(self, avail, parent=None):
+    def __init__(self, avail, parent=None, combo_size=4):
         super().__init__(parent)
         self._avail = avail; self._results = {}; self._running = False
+        self._combo_size = max(1, min(10, int(combo_size)))
         self.setWindowTitle("基准测试")
         self.setMinimumWidth(480); self.setMinimumHeight(360)
         self.setStyleSheet(QSS)
@@ -463,7 +485,7 @@ class BenchmarkDialog(QDialog):
         t = QLabel("⚡  计算后端基准测试")
         t.setStyleSheet(f"color:{ACCENT};font-size:16px;font-weight:700;")
         lay.addWidget(t)
-        d = QLabel("使用模拟数据测试各后端枚举组合速度，结果用于预估实际运算时间。")
+        d = QLabel(f"使用模拟数据测试各后端枚举组合速度（当前组合件数：{self._combo_size}），结果用于预估实际运算时间。")
         d.setStyleSheet(f"color:{TEXT2};font-size:12px;"); d.setWordWrap(True)
         lay.addWidget(d)
 
@@ -544,7 +566,7 @@ class BenchmarkDialog(QDialog):
                       5500301,5500302,5500303,5500304]
         try:
             import sys, os
-            _proj = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            _proj = os.path.dirname(os.path.abspath(__file__))
             if _proj not in sys.path: sys.path.insert(0, _proj)
             from cpp_extension.module_optimizer_cpp import ModuleInfo, ModulePart
         except Exception as e:
@@ -561,7 +583,7 @@ class BenchmarkDialog(QDialog):
     def _worker(self):
         """子线程：调用真实C++扩展计时，通过Signal回传结果"""
         import math as _math, time as _time, sys, os
-        _proj = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _proj = os.path.dirname(os.path.abspath(__file__))
         if _proj not in sys.path:
             sys.path.insert(0, _proj)
 
@@ -575,7 +597,7 @@ class BenchmarkDialog(QDialog):
         ]
 
         # 构造测试模组，N=500 → C(500,4)=2,573,031,125组合，充分压测GPU性能
-        N_MODULES = 500
+        N_MODULES = 200
         try:
             modules = self._make_bench_modules(N_MODULES)
         except Exception as e:
@@ -583,7 +605,7 @@ class BenchmarkDialog(QDialog):
             self._sig_done.emit(); return
 
         n = N_MODULES
-        k = 4
+        k = self._combo_size
         total_combos = _math.comb(n, k)
         self._sig_log.emit(f"测试规模：{n} 个模组，C({n},{k}) = {total_combos:,} 组合")
 
@@ -607,7 +629,7 @@ class BenchmarkDialog(QDialog):
             self._sig_log.emit(f"测试 {lbl}（{fn_name}）…")
             try:
                 t0 = _time.perf_counter()
-                fn(modules, set(), set(), {}, 60, 8)
+                fn(modules, set(), set(), {}, 60, 8, k)
                 elapsed = _time.perf_counter() - t0
                 # 万组合/秒
                 ops = (total_combos / elapsed) / 10000.0
@@ -632,6 +654,7 @@ class MonitorWorker(QThread):
     done_signal     = Signal()
     error_signal    = Signal(str)
     progress_signal = Signal(int, str)
+    module_count_signal = Signal(int)   # 扫描到的模组数量，用于动态计算 C(N,k)
 
     def __init__(self, cfg):
         super().__init__()
@@ -673,7 +696,12 @@ class MonitorWorker(QThread):
         if excl:                        cli += ["-exattr"] + excl  # --exclude-attributes
         mc = cfg.get("match_count", 1)
         cli += ["-mc", str(mc)]                                    # --match-count
-        # GPU模式：CLI本身无 -cuda/-opencl 参数，通过环境变量或忽略（optimizer内部自动选）
+        # 组合件数（修复问题2：combo_size 1-10 现在真正生效）
+        cs = cfg.get("combo_size", 4)
+        cli += ["-cs", str(cs)]                                    # --combo-size
+        # 计算模式（修复问题1：计算模式选择现在真正生效）
+        compute_mode = cfg.get("mode", "cpu")
+        cli += ["-cm", compute_mode]                               # --compute-mode
         mas = cfg.get("min_attr_sum",{})
         if mas:
             for k,v in mas.items():
@@ -775,6 +803,17 @@ class MonitorWorker(QThread):
             if _key:
                 self.log_signal.emit(f"[INFO] {line}" if not line.startswith("[") else line)
 
+            # ── 解析模组总数 N（用于主界面动态预估 C(N,k)）──
+            import re as _re2
+            _mc = (_re2.search(r"共\s*(\d+)\s*个模组", line) or
+                   _re2.search(r"模组总数[：:]\s*(\d+)", line) or
+                   _re2.search(r"找到\s*(\d+)\s*个模组", line) or
+                   _re2.search(r"加载.*?(\d+)\s*个模组", line) or
+                   _re2.search(r"扫描.*?(\d+)\s*个模组", line) or
+                   _re2.search(r"(\d+)\s*modules?\s+loaded", line, _re2.IGNORECASE))
+            if _mc:
+                self.module_count_signal.emit(int(_mc.group(1)))
+
             # 匹配 "=== 第N名搭配 ==="
             m = _re.match(r"=== 第(\d+)名搭配 ===", line)
             if m:
@@ -864,6 +903,22 @@ class ConfigPanel(QWidget):
         def lbl(t):
             l=QLabel(t); l.setStyleSheet(f"color:{TEXT2};font-size:12px;"); return l
 
+        # ── 导入 / 导出配置码 ─────────────────────────────
+        g0 = QGroupBox("CONFIG CODE"); g0l = QHBoxLayout(); g0l.setContentsMargins(10,12,10,10); g0l.setSpacing(8); g0.setLayout(g0l)
+        btn_exp = QPushButton("⬆  导出配置码")
+        btn_imp = QPushButton("⬇  导入配置码")
+        for b in (btn_exp, btn_imp):
+            b.setFixedHeight(32)
+            b.setStyleSheet(
+                f"QPushButton{{background:{BG3};color:{TEXT2};"
+                f"border:1px solid {BORDER};border-radius:6px;"
+                f"font-size:12px;font-weight:600;padding:0 10px;}}"
+                f"QPushButton:hover{{color:{ACCENT};border-color:{ACCENT2};}}")
+        btn_exp.clicked.connect(self._export_config)
+        btn_imp.clicked.connect(self._import_config)
+        g0l.addWidget(btn_exp, 1); g0l.addWidget(btn_imp, 1)
+        lay.addWidget(g0)
+
         # ── 网络接口 ─────────────────────────────────────
         g = QGroupBox("NETWORK INTERFACE"); gl = QVBoxLayout(); gl.setSpacing(6); gl.setContentsMargins(10,14,10,10); g.setLayout(gl)
         self.chk_auto = QCheckBox("自动选择接口（推荐）"); self.chk_auto.setChecked(True)
@@ -936,6 +991,73 @@ class ConfigPanel(QWidget):
         g6l.addWidget(self.mas_widget); lay.addWidget(g6)
 
         lay.addStretch()
+
+    def _export_config(self):
+        cfg = self.get_config()
+        code = base64.b64encode(json.dumps(cfg, ensure_ascii=False).encode()).decode()
+        dlg = QDialog(self); dlg.setWindowTitle("导出配置码"); dlg.resize(500, 180)
+        dlg.setStyleSheet(f"background:{BG2};color:{TEXT};")
+        vl = QVBoxLayout(dlg); vl.setSpacing(10); vl.setContentsMargins(16,16,16,16)
+        vl.addWidget(QLabel("复制以下配置码，可在任何地方导入还原配置："))
+        te = QTextEdit(); te.setPlainText(code); te.setReadOnly(True)
+        te.setFixedHeight(60); te.setStyleSheet(f"background:{BG3};color:{ACCENT};border:1px solid {BORDER};border-radius:6px;font-family:monospace;font-size:11px;")
+        vl.addWidget(te)
+        hl = QHBoxLayout()
+        btn_copy = QPushButton("📋  复制到剪贴板"); btn_copy.setFixedHeight(32)
+        btn_copy.setStyleSheet(f"QPushButton{{background:{ACCENT_DIM};color:{ACCENT};border:1px solid {ACCENT2};border-radius:6px;font-size:12px;font-weight:600;padding:0 14px;}}QPushButton:hover{{background:{ACCENT2};color:#fff;}}")
+        btn_copy.clicked.connect(lambda: (QApplication.clipboard().setText(code), btn_copy.setText("✓  已复制")))
+        btn_close = QPushButton("关闭"); btn_close.setFixedHeight(32)
+        btn_close.setStyleSheet(f"QPushButton{{background:{BG3};color:{TEXT2};border:1px solid {BORDER};border-radius:6px;font-size:12px;padding:0 14px;}}QPushButton:hover{{color:{TEXT};border-color:{TEXT2};}}")
+        btn_close.clicked.connect(dlg.accept)
+        hl.addWidget(btn_copy); hl.addStretch(); hl.addWidget(btn_close)
+        vl.addLayout(hl)
+        dlg.exec()
+
+    def _import_config(self):
+        dlg = QDialog(self); dlg.setWindowTitle("导入配置码"); dlg.resize(500, 200)
+        dlg.setStyleSheet(f"background:{BG2};color:{TEXT};")
+        vl = QVBoxLayout(dlg); vl.setSpacing(10); vl.setContentsMargins(16,16,16,16)
+        vl.addWidget(QLabel("粘贴配置码后点击导入："))
+        te = QTextEdit(); te.setPlaceholderText("在此粘贴配置码…")
+        te.setFixedHeight(70); te.setStyleSheet(f"background:{BG3};color:{TEXT};border:1px solid {BORDER};border-radius:6px;font-family:monospace;font-size:11px;")
+        vl.addWidget(te)
+        lbl_err = QLabel(""); lbl_err.setStyleSheet(f"color:{DANGER};font-size:11px;")
+        vl.addWidget(lbl_err)
+        hl = QHBoxLayout()
+        btn_ok = QPushButton("⬇  导入"); btn_ok.setFixedHeight(32)
+        btn_ok.setStyleSheet(f"QPushButton{{background:{ACCENT_DIM};color:{ACCENT};border:1px solid {ACCENT2};border-radius:6px;font-size:12px;font-weight:600;padding:0 14px;}}QPushButton:hover{{background:{ACCENT2};color:#fff;}}")
+        btn_cancel = QPushButton("取消"); btn_cancel.setFixedHeight(32)
+        btn_cancel.setStyleSheet(f"QPushButton{{background:{BG3};color:{TEXT2};border:1px solid {BORDER};border-radius:6px;font-size:12px;padding:0 14px;}}QPushButton:hover{{color:{TEXT};border-color:{TEXT2};}}")
+        def _do_import():
+            code = te.toPlainText().strip()
+            try:
+                cfg = json.loads(base64.b64decode(code.encode()).decode())
+                self.set_config(cfg)
+                dlg.accept()
+            except Exception as e:
+                lbl_err.setText(f"❌ 解析失败：{e}")
+        btn_ok.clicked.connect(_do_import); btn_cancel.clicked.connect(dlg.reject)
+        hl.addWidget(btn_ok); hl.addStretch(); hl.addWidget(btn_cancel)
+        vl.addLayout(hl)
+        dlg.exec()
+
+    def set_config(self, cfg: dict):
+        """从配置字典恢复所有控件状态"""
+        self.chk_auto.setChecked(bool(cfg.get("auto_interface", True)))
+        self.spin_iface.setValue(int(cfg.get("interface_index", 0)))
+        self.spin_iface.setEnabled(not bool(cfg.get("auto_interface", True)))
+        self.chk_vdata.setChecked(bool(cfg.get("load_vdata", False)))
+        cat = cfg.get("category", "全部")
+        idx = self.combo_cat.findText(cat)
+        if idx >= 0: self.combo_cat.setCurrentIndex(idx)
+        self.attr_sel.set_selected(cfg.get("attributes", []))
+        self.excl_sel.set_selected(cfg.get("exclude_attributes", []))
+        self.spin_mc.setValue(int(cfg.get("match_count", 1)))
+        self.spin_combo.setValue(int(cfg.get("combo_size", 4)))
+        self.chk_enum.setChecked(bool(cfg.get("enumeration_mode", False)))
+        self.chk_debug.setChecked(bool(cfg.get("debug", False)))
+        self.mas_widget.set_constraints(cfg.get("min_attr_sum", {}))
+        self.config_changed.emit()
 
     def _list_ifaces(self):
         try:
@@ -1266,8 +1388,10 @@ class BottomBar(QWidget):
         if lbl: self.lbl_prog.setText(lbl)
 
     def update_estimate(self, n, k, mode, bench):
-        if n < k:
-            self.lbl_est.setText("预估时间：—"); self.lbl_combo.setText("组合数：—"); return
+        if not n or n < k:
+            self.lbl_est.setText("预估时间：—")
+            self.lbl_combo.setText("组合数：需先运行一次扫描")
+            return
         try:   total=math.comb(n,k)
         except: total=0
         combo_str=f"{total:,}" if total<1_000_000 else f"{total/1e4:.1f} 万"
@@ -1335,6 +1459,7 @@ class MainWindow(QMainWindow):
         self._bench: Dict[str,float] = {}
         self._avail: Dict[str,bool] = {"cuda":False,"opencl":False,"cpu":True}
         self._mode = "cpu"
+        self._last_module_n: Optional[int] = None   # 上次扫描到的模组数量，用于 C(N,k) 动态估算
         self._setup_log(); self._build_ui(); self._connect_log_handler(); self._probe_gpu()
 
     def _build_ui(self):
@@ -1374,15 +1499,14 @@ class MainWindow(QMainWindow):
     def _probe_gpu(self):
         self._sig_gpu_result.connect(self._on_gpu_result)
         def probe():
-            cuda=opencl=False
+            cuda = False
+            opencl = False
             try:
-                from cpp_extension.module_optimizer_cpp import test_cuda
-                cuda=test_cuda()
-            except: pass
-            try:
-                from cpp_extension.module_optimizer_cpp import strategy_enumeration_opencl_cpp
-                opencl=True
-            except: pass
+                from cpp_extension.module_optimizer_cpp import test_cuda, test_opencl
+                cuda = bool(test_cuda())
+                opencl = bool(test_opencl())
+            except Exception:
+                pass
             self._sig_gpu_result.emit(cuda, opencl)
         threading.Thread(target=probe,daemon=True).start()
 
@@ -1401,13 +1525,18 @@ class MainWindow(QMainWindow):
         self._mode=mode; self._upd_est()
 
     def _upd_est(self):
-        cfg=self.cfg.get_config()
-        k=cfg.get("combo_size",4)
-        n=max(20,80-len(cfg.get("attributes",[]))*5)
-        self.bar.update_estimate(n,k,self._mode,self._bench)
+        cfg = self.cfg.get_config()
+        k   = cfg.get("combo_size", 4)
+        n   = self._last_module_n
+        if n is None or n < k:
+            # 尚未运行过扫描，显示占位
+            self.bar.update_estimate(0, k, self._mode, self._bench)
+        else:
+            self.bar.update_estimate(n, k, self._mode, self._bench)
 
     def _open_bench(self):
-        dlg=BenchmarkDialog(self._avail,self); dlg.exec()
+        combo_size = int(self.cfg.get_config().get("combo_size", 4))
+        dlg=BenchmarkDialog(self._avail, self, combo_size=combo_size); dlg.exec()
         r=dlg.get_results()
         if r: self._bench=r; self._upd_est()
 
@@ -1418,9 +1547,15 @@ class MainWindow(QMainWindow):
         self._worker=MonitorWorker(cfg)
         self._worker.log_signal.connect(self.out.append_log_plain)
         self._worker.progress_signal.connect(lambda v,l: self.bar.update_progress(v,l))
+        self._worker.module_count_signal.connect(self._on_module_count)
         self._worker.done_signal.connect(self._on_done)
         self._worker.error_signal.connect(self._on_err)
         self._worker.start()
+
+    @Slot(int)
+    def _on_module_count(self, n):
+        self._last_module_n = n
+        self._upd_est()
 
     def _stop(self):
         if self._worker and self._worker.isRunning():

@@ -148,6 +148,7 @@ extern "C" int GpuStrategyEnumerationOpenCL(
     const int *min_attr_ids,
     const int *min_attr_values,
     int min_attr_count,
+    int combo_size,
     int max_solutions,
     int *result_scores,
     long long *result_indices) {
@@ -179,7 +180,8 @@ extern "C" int GpuStrategyEnumerationOpenCL(
         for (unsigned long long i = 0; i < r; ++i) res = (res * (n - i)) / (i + 1ULL); 
         return res;
     };
-    unsigned long long total_combinations = comb_count((unsigned long long)module_count, 4ULL);
+    unsigned long long total_combinations = comb_count((unsigned long long)module_count, (unsigned long long)combo_size);
+    int slots_per_sol = (combo_size + 3) / 4;  // ceil(combo_size/4) ulongs per solution
     CalculateOptimalParamsOpenCL(&gpu_config, total_combinations);
 
     // 打印配置信息
@@ -208,7 +210,6 @@ __constant int TOTAL_ATTR_POWER_VALUES[121] = {
 };
 
 inline int is_special_id(int id) {
-    #pragma unroll
     for (int i = 0; i < 8; ++i) if (SPECIAL_ATTRS[i] == id) return 1; return 0;
 }
 inline int in_set(__global const int * restrict arr, int n, int v) {
@@ -220,7 +221,8 @@ ulong comb_count(ulong n, ulong r) {
     ulong res = 1UL; for (ulong i = 0; i < r; ++i) { res = (res * (n - i)) / (i + 1UL); } return res;
 }
 
-void get_combination_by_index(uint n, uint r, ulong idx, uint comb_out[4]) {
+/* 支持最多10件的组合 */
+void get_combination_by_index(uint n, uint r, ulong idx, uint comb_out[10]) {
     ulong remaining = idx;
     for (uint i = 0; i < r; ++i) {
         uint start = (i == 0U) ? 0U : (comb_out[i-1] + 1U);
@@ -232,20 +234,22 @@ void get_combination_by_index(uint n, uint r, ulong idx, uint comb_out[4]) {
     }
 }
 
-int next_combination(uint n, uint r, uint comb[4]) {
+int next_combination(uint n, uint r, uint comb[10]) {
     for (int pos = (int)r - 1; pos >= 0; --pos) {
         uint limit = n - r + (uint)pos;
         if (comb[pos] < limit) {
             ++comb[pos];
-            for (uint k = (uint)pos + 1U; k < r; ++k) {
+            for (uint k = (uint)pos + 1U; k < r; ++k)
                 comb[k] = comb[k - 1U] + 1U;
-            }
             return 1;
         }
     }
     return 0;
 }
 
+/* score_range: 支持 combo_size 1~10
+   out_indices 布局：每解占 slots_per_sol 个 ulong
+   第 i 解第 s 个 slot 在 out_indices[i * slots_per_sol + s] */
 __kernel void score_range(
     __global const int * restrict module_attr_ids,
     __global const int * restrict module_attr_values,
@@ -260,105 +264,100 @@ __kernel void score_range(
     __global const int * restrict min_attr_ids,
     __global const int * restrict min_attr_values,
     int min_attr_count,
+    int combo_size,
+    int slots_per_sol,
     ulong range_start,
     ulong range_len,
     __global int * restrict out_scores,
     __global ulong * restrict out_indices) {
+
     ulong gid = (ulong)get_global_id(0);
     ulong total_threads = (ulong)get_global_size(0);
-    
-    ulong total_work = range_len;
-    if (total_work == 0) return;
-    
-    ulong work_per_thread = (total_work + total_threads - 1) / total_threads;
+    if (range_len == 0UL) return;
+    ulong work_per_thread = (range_len + total_threads - 1UL) / total_threads;
     ulong seg_start = range_start + gid * work_per_thread;
     if (seg_start >= range_start + range_len) return;
     ulong seg_end = seg_start + work_per_thread;
     if (seg_end > range_start + range_len) seg_end = range_start + range_len;
-    
-    uint comb[4];
-    get_combination_by_index((uint)module_count, 4U, seg_start, comb);
-    
+
+    uint comb[10];
+    get_combination_by_index((uint)module_count, (uint)combo_size, seg_start, comb);
+
     for (ulong combo_idx = seg_start; combo_idx < seg_end; ++combo_idx) {
         ulong gid_local = combo_idx - range_start;
 
-        int attr_ids[20];
-        int attr_vals[20];
+        /* 属性聚合（最多32个不同属性） */
+        int attr_ids[32];
+        int attr_vals[32];
         int attr_cnt = 0;
         int total_attr_value = 0;
-        
-        #pragma unroll
-        for (int t = 0; t < 4; ++t) {
-            int mi = (int)comb[t];
+
+        for (int t = 0; t < combo_size; ++t) {
+            int mi  = (int)comb[t];
             int off = module_offsets[mi];
             int cnt = module_attr_counts[mi];
-            
-            #pragma unroll
-            for (int k = 0; k < 3; ++k) {
-                if (k < cnt) {
-                    int aid = module_attr_ids[off + k];
-                    int aval = module_attr_values[off + k];
-                    total_attr_value += aval;
-                    int found = -1;
-                    #pragma unroll
-                    for (int u = 0; u < 12; ++u) { 
-                        if (u < attr_cnt && attr_ids[u] == aid) { found = u; break; } 
-                    }
-                    if (found >= 0) { attr_vals[found] += aval; }
-                    else if (attr_cnt < 12) { attr_ids[attr_cnt] = aid; attr_vals[attr_cnt] = aval; attr_cnt++; }
+            for (int k = 0; k < cnt; ++k) {
+                int aid  = module_attr_ids[off + k];
+                int aval = module_attr_values[off + k];
+                total_attr_value += aval;
+                int found = -1;
+                for (int u = 0; u < attr_cnt && u < 32; ++u) {
+                    if (attr_ids[u] == aid) { found = u; break; }
                 }
+                if (found >= 0) { attr_vals[found] += aval; }
+                else if (attr_cnt < 32) { attr_ids[attr_cnt] = aid; attr_vals[attr_cnt] = aval; attr_cnt++; }
             }
         }
 
+        /* min_attr_sum 约束 */
         int pass_min_filter = 1;
         for (int m = 0; m < min_attr_count; ++m) {
             int req_id = min_attr_ids[m];
-            int req_v = min_attr_values[m];
-            int sum_v = 0, ok = 0;
-            #pragma unroll
-            for (int u = 0; u < 12; ++u) {
-                if (u < attr_cnt && attr_ids[u] == req_id) { sum_v = attr_vals[u]; ok = 1; break; }
+            int req_v  = min_attr_values[m];
+            int sum_v  = 0, ok = 0;
+            for (int u = 0; u < attr_cnt; ++u) {
+                if (attr_ids[u] == req_id) { sum_v = attr_vals[u]; ok = 1; break; }
             }
-            if (!ok || sum_v < req_v) {
-                pass_min_filter = 0;
-                break;
-            }
+            if (!ok || sum_v < req_v) { pass_min_filter = 0; break; }
         }
-        
+
         if (!pass_min_filter) {
             out_scores[gid_local] = 0;
-            out_indices[gid_local] = 0UL;
-            if (!next_combination((uint)module_count, 4U, comb)) {
-                break;
-            }
+            for (int s = 0; s < slots_per_sol; ++s)
+                out_indices[gid_local * slots_per_sol + s] = 0UL;
+            if (!next_combination((uint)module_count, (uint)combo_size, comb)) break;
             continue;
         }
 
+        /* 评分 */
         int threshold_power = 0;
-        #pragma unroll
-        for (int i = 0; i < 12; ++i) {
-            if (i < attr_cnt) {
-                int aval = attr_vals[i];
-                int aid = attr_ids[i];
-                int lvl = 0;
-                #pragma unroll
-                for (int L = 0; L < 6; ++L) { if (aval >= ATTR_THRESHOLDS[L]) lvl = L + 1; else break; }
-                if (lvl > 0) {
-                    int base = is_special_id(aid) ? SPECIAL_POWER_VALUES[lvl - 1] : BASIC_POWER_VALUES[lvl - 1];
-                    if (target_count > 0 && in_set(target_attrs, target_count, aid)) threshold_power += base * 2;
-                    else if (exclude_count > 0 && in_set(exclude_attrs, exclude_count, aid)) threshold_power += 0;
-                    else threshold_power += base;
-                }
+        for (int i = 0; i < attr_cnt; ++i) {
+            int aval = attr_vals[i];
+            int aid  = attr_ids[i];
+            int lvl  = 0;
+            for (int L = 0; L < 6; ++L) { if (aval >= ATTR_THRESHOLDS[L]) lvl = L + 1; else break; }
+            if (lvl > 0) {
+                int base = is_special_id(aid) ? SPECIAL_POWER_VALUES[lvl - 1] : BASIC_POWER_VALUES[lvl - 1];
+                if (target_count > 0 && in_set(target_attrs, target_count, aid))   threshold_power += base * 2;
+                else if (exclude_count > 0 && in_set(exclude_attrs, exclude_count, aid)) { /* 0 */ }
+                else threshold_power += base;
             }
         }
         int idx_total = total_attr_value > 120 ? 120 : total_attr_value;
-        int total_power = threshold_power + TOTAL_ATTR_POWER_VALUES[idx_total];
-        out_scores[gid_local] = total_power;
-        out_indices[gid_local] = ((ulong)comb[0]) | ((ulong)comb[1] << 16) | ((ulong)comb[2] << 32) | ((ulong)comb[3] << 48);
-        
-        if (!next_combination((uint)module_count, 4U, comb)) {
-            break;
+        out_scores[gid_local] = threshold_power + TOTAL_ATTR_POWER_VALUES[idx_total];
+
+        /* 打包索引：每4个索引存入1个 ulong (每格16bit) */
+        for (int s = 0; s < slots_per_sol; ++s) {
+            ulong packed = 0UL;
+            int base = s * 4;
+            int in_slot = combo_size - base;
+            if (in_slot > 4) in_slot = 4;
+            for (int j = 0; j < in_slot; ++j)
+                packed |= ((ulong)comb[base + j] << (j * 16));
+            out_indices[gid_local * slots_per_sol + s] = packed;
         }
+
+        if (!next_combination((uint)module_count, (uint)combo_size, comb)) break;
     }
 }
 
@@ -374,12 +373,8 @@ __kernel void histogram_byte_radix(
     size_t lsz = get_local_size(0);
     size_t gid = get_global_id(0);
     size_t gsz = get_global_size(0);
-    
-    for (uint i = lid; i < RADIX_BINS; i += lsz) {
-        s_hist[i] = 0U;
-    }
+    for (uint i = lid; i < RADIX_BINS; i += lsz) s_hist[i] = 0U;
     barrier(CLK_LOCAL_MEM_FENCE);
-    
     int shift = byte_idx * 8;
     for (ulong idx = gid; idx < n; idx += gsz) {
         uint s = (uint)scores[idx];
@@ -389,11 +384,8 @@ __kernel void histogram_byte_radix(
         }
     }
     barrier(CLK_LOCAL_MEM_FENCE);
-    
     for (uint i = lid; i < RADIX_BINS; i += lsz) {
-        if (s_hist[i] > 0) {
-            atomic_add((volatile __global uint *)&g_hist[i], s_hist[i]);
-        }
+        if (s_hist[i] > 0) atomic_add((volatile __global uint *)&g_hist[i], s_hist[i]);
     }
 }
 
@@ -404,17 +396,17 @@ __kernel void flag_scores_by_threshold(
     __global uchar * restrict flags) {
     size_t gid = get_global_id(0);
     size_t gsz = get_global_size(0);
-    for (ulong i = gid; i < n; i += gsz) {
-        int s = scores[i];
-        flags[i] = (uchar)((s >= threshold) ? 1 : 0);
-    }
+    for (ulong i = gid; i < n; i += gsz)
+        flags[i] = (uchar)((scores[i] >= threshold) ? 1 : 0);
 }
 
+/* compact_selected: slots_per_sol 个 ulong 对应一个解，需要全部拷贝 */
 __kernel void compact_selected(
     __global const int * restrict scores,
     __global const ulong * restrict indices,
     __global const uchar * restrict flags,
     ulong n,
+    int slots_per_sol,
     __global int * restrict out_scores,
     __global ulong * restrict out_indices,
     __global uint * restrict out_count) {
@@ -424,7 +416,8 @@ __kernel void compact_selected(
         if (flags[i]) {
             uint pos = (uint)atomic_inc((volatile __global int *)out_count);
             out_scores[pos] = scores[i];
-            out_indices[pos] = indices[i];
+            for (int s = 0; s < slots_per_sol; ++s)
+                out_indices[pos * slots_per_sol + s] = indices[i * slots_per_sol + s];
         }
     }
 }
@@ -508,7 +501,12 @@ __kernel void compact_selected(
         return 0;
     }
 
-    struct Item { int score; unsigned long long idx; bool operator<(const Item& o) const { return score > o.score; } };
+    struct Item {
+        int score;
+        unsigned long long slots[3]; // max ceil(10/4)=3
+        int slot_count;
+        bool operator<(const Item& o) const { return score > o.score; }
+    };
     std::priority_queue<Item> topk;
 
     unsigned long long processed = 0ULL;
@@ -516,8 +514,10 @@ __kernel void compact_selected(
         unsigned long long batch = std::min(gpu_config.optimal_batch_size, total_combinations - processed);
         size_t outN = (size_t)batch;
 
-        cl_mem d_scores = clCreateBuffer(ctx, CL_MEM_READ_WRITE, sizeof(int) * outN, nullptr, &err);
-        cl_mem d_indices = clCreateBuffer(ctx, CL_MEM_READ_WRITE, sizeof(unsigned long long) * outN, nullptr, &err);
+        cl_mem d_scores  = clCreateBuffer(ctx, CL_MEM_READ_WRITE, sizeof(int) * outN, nullptr, &err);
+        // 每个解占 slots_per_sol 个 ulong
+        cl_mem d_indices = clCreateBuffer(ctx, CL_MEM_READ_WRITE,
+                                          sizeof(unsigned long long) * outN * slots_per_sol, nullptr, &err);
 
         int arg = 0;
         clSetKernelArg(kernel, arg++, sizeof(cl_mem), &d_attr_ids);
@@ -533,6 +533,8 @@ __kernel void compact_selected(
         clSetKernelArg(kernel, arg++, sizeof(cl_mem), &d_min_ids);
         clSetKernelArg(kernel, arg++, sizeof(cl_mem), &d_min_vals);
         clSetKernelArg(kernel, arg++, sizeof(int), &min_attr_count);
+        clSetKernelArg(kernel, arg++, sizeof(int), &combo_size);       // 新增
+        clSetKernelArg(kernel, arg++, sizeof(int), &slots_per_sol);    // 新增
         unsigned long long range_start = processed;
         clSetKernelArg(kernel, arg++, sizeof(unsigned long long), &range_start);
         cl_ulong range_len = (cl_ulong)batch;
@@ -542,35 +544,24 @@ __kernel void compact_selected(
 
         size_t lsz = gpu_config.optimal_local_size;
         size_t target_threads = gpu_config.optimal_global_size;
-        if (target_threads > (size_t)batch) {
+        if (target_threads > (size_t)batch)
             target_threads = ((size_t)batch + lsz - 1) / lsz * lsz;
-        }
         size_t gsz = target_threads;
-        
+
         err = clEnqueueNDRangeKernel(q, kernel, 1, nullptr, &gsz, &lsz, 0, nullptr, nullptr);
-        if (err != CL_SUCCESS) { 
-            clReleaseMemObject(d_indices); 
-            clReleaseMemObject(d_scores); 
-            break; 
-        }
+        if (err != CL_SUCCESS) { clReleaseMemObject(d_indices); clReleaseMemObject(d_scores); break; }
         clFinish(q);
 
         cl_ulong n64 = (cl_ulong)outN;
         cl_mem d_hist = clCreateBuffer(ctx, CL_MEM_READ_WRITE, sizeof(cl_uint) * 256, nullptr, &err);
-        if (!d_hist || err != CL_SUCCESS) { 
-            clReleaseMemObject(d_indices); 
-            clReleaseMemObject(d_scores); 
-            break; 
-        }
-        
-        cl_uint prefix_mask = 0U;
-        cl_uint prefix_value = 0U;
+        if (!d_hist || err != CL_SUCCESS) { clReleaseMemObject(d_indices); clReleaseMemObject(d_scores); break; }
+
+        cl_uint prefix_mask = 0U, prefix_value = 0U;
         int k_needed = max_solutions;
-        
+
         for (int byte_idx = 3; byte_idx >= 0; --byte_idx) {
             cl_uint zero_u = 0U;
             clEnqueueFillBuffer(q, d_hist, &zero_u, sizeof(cl_uint), 0, sizeof(cl_uint) * 256, 0, nullptr, nullptr);
-            
             int harg = 0;
             clSetKernelArg(k_hist_radix, harg++, sizeof(cl_mem), &d_scores);
             clSetKernelArg(k_hist_radix, harg++, sizeof(cl_ulong), &n64);
@@ -579,73 +570,54 @@ __kernel void compact_selected(
             clSetKernelArg(k_hist_radix, harg++, sizeof(int), &byte_idx);
             clSetKernelArg(k_hist_radix, harg++, sizeof(cl_mem), &d_hist);
             clSetKernelArg(k_hist_radix, harg++, sizeof(cl_uint) * 256, nullptr);
-            
             err = clEnqueueNDRangeKernel(q, k_hist_radix, 1, nullptr, &gsz, &lsz, 0, nullptr, nullptr);
-            if (err != CL_SUCCESS) { 
-                clReleaseMemObject(d_hist); 
-                clReleaseMemObject(d_indices); 
-                clReleaseMemObject(d_scores); 
-                break; 
+            if (err != CL_SUCCESS) {
+                clReleaseMemObject(d_hist); clReleaseMemObject(d_indices); clReleaseMemObject(d_scores); break;
             }
             clFinish(q);
-            
             cl_uint h_hist[256];
             clEnqueueReadBuffer(q, d_hist, CL_TRUE, 0, sizeof(cl_uint) * 256, h_hist, 0, nullptr, nullptr);
             clFinish(q);
-            
-            cl_uint acc = 0U;
-            int chosen_bucket = 0;
+            cl_uint acc = 0U; int chosen_bucket = 0;
             for (int b = 255; b >= 0; --b) {
                 acc += h_hist[b];
-                if (acc >= (cl_uint)k_needed) {
-                    chosen_bucket = b;
-                    break;
-                }
+                if (acc >= (cl_uint)k_needed) { chosen_bucket = b; break; }
             }
-            
             cl_uint bigger_acc = acc - h_hist[chosen_bucket];
             k_needed -= (int)bigger_acc;
-            
             cl_uint mask_byte = 0xFFU << (byte_idx * 8);
-            prefix_mask |= mask_byte;
+            prefix_mask  |= mask_byte;
             prefix_value |= ((cl_uint)chosen_bucket << (byte_idx * 8));
         }
-        
+
         int threshold_value = (int)prefix_value;
         clReleaseMemObject(d_hist);
 
         cl_mem d_flags = clCreateBuffer(ctx, CL_MEM_READ_WRITE, sizeof(unsigned char) * outN, nullptr, &err);
-        if (!d_flags || err != CL_SUCCESS) { 
-            clReleaseMemObject(d_indices); 
-            clReleaseMemObject(d_scores);
-            break; 
-        }
+        if (!d_flags || err != CL_SUCCESS) { clReleaseMemObject(d_indices); clReleaseMemObject(d_scores); break; }
         int farg = 0;
         clSetKernelArg(k_flag, farg++, sizeof(cl_mem), &d_scores);
         clSetKernelArg(k_flag, farg++, sizeof(cl_ulong), &n64);
         clSetKernelArg(k_flag, farg++, sizeof(int), &threshold_value);
         clSetKernelArg(k_flag, farg++, sizeof(cl_mem), &d_flags);
         err = clEnqueueNDRangeKernel(q, k_flag, 1, nullptr, &gsz, &lsz, 0, nullptr, nullptr);
-        if (err != CL_SUCCESS) { 
-            clReleaseMemObject(d_flags); 
-            clReleaseMemObject(d_indices); 
-            clReleaseMemObject(d_scores); 
-            break; 
+        if (err != CL_SUCCESS) {
+            clReleaseMemObject(d_flags); clReleaseMemObject(d_indices); clReleaseMemObject(d_scores); break;
         }
         clFinish(q);
 
         cl_mem d_selected_count = clCreateBuffer(ctx, CL_MEM_READ_WRITE, sizeof(cl_uint), nullptr, &err);
         cl_uint zero_u = 0;
         clEnqueueWriteBuffer(q, d_selected_count, CL_TRUE, 0, sizeof(cl_uint), &zero_u, 0, nullptr, nullptr);
-        cl_mem d_comp_scores = clCreateBuffer(ctx, CL_MEM_READ_WRITE, sizeof(int) * outN, nullptr, &err);
-        cl_mem d_comp_indices = clCreateBuffer(ctx, CL_MEM_READ_WRITE, sizeof(unsigned long long) * outN, nullptr, &err);
+        cl_mem d_comp_scores  = clCreateBuffer(ctx, CL_MEM_READ_WRITE, sizeof(int) * outN, nullptr, &err);
+        // compact 输出同样需要 slots_per_sol 个 ulong/解
+        cl_mem d_comp_indices = clCreateBuffer(ctx, CL_MEM_READ_WRITE,
+                                               sizeof(unsigned long long) * outN * slots_per_sol, nullptr, &err);
         if (!d_comp_scores || !d_comp_indices || err != CL_SUCCESS) {
             if (d_comp_indices) clReleaseMemObject(d_comp_indices);
-            if (d_comp_scores) clReleaseMemObject(d_comp_scores);
+            if (d_comp_scores)  clReleaseMemObject(d_comp_scores);
             clReleaseMemObject(d_selected_count);
-            clReleaseMemObject(d_flags);
-            clReleaseMemObject(d_indices);
-            clReleaseMemObject(d_scores);
+            clReleaseMemObject(d_flags); clReleaseMemObject(d_indices); clReleaseMemObject(d_scores);
             break;
         }
         int carg = 0;
@@ -653,17 +625,15 @@ __kernel void compact_selected(
         clSetKernelArg(k_compact, carg++, sizeof(cl_mem), &d_indices);
         clSetKernelArg(k_compact, carg++, sizeof(cl_mem), &d_flags);
         clSetKernelArg(k_compact, carg++, sizeof(cl_ulong), &n64);
-        clSetKernelArg(k_compact, carg++, sizeof(cl_mem), &d_comp_scores);
-        clSetKernelArg(k_compact, carg++, sizeof(cl_mem), &d_comp_indices);
-        clSetKernelArg(k_compact, carg++, sizeof(cl_mem), &d_selected_count);
+        clSetKernelArg(k_compact, carg++, sizeof(int),     &slots_per_sol); // 新增
+        clSetKernelArg(k_compact, carg++, sizeof(cl_mem),  &d_comp_scores);
+        clSetKernelArg(k_compact, carg++, sizeof(cl_mem),  &d_comp_indices);
+        clSetKernelArg(k_compact, carg++, sizeof(cl_mem),  &d_selected_count);
         err = clEnqueueNDRangeKernel(q, k_compact, 1, nullptr, &gsz, &lsz, 0, nullptr, nullptr);
         if (err != CL_SUCCESS) {
-            clReleaseMemObject(d_comp_indices);
-            clReleaseMemObject(d_comp_scores);
+            clReleaseMemObject(d_comp_indices); clReleaseMemObject(d_comp_scores);
             clReleaseMemObject(d_selected_count);
-            clReleaseMemObject(d_flags);
-            clReleaseMemObject(d_indices);
-            clReleaseMemObject(d_scores);
+            clReleaseMemObject(d_flags); clReleaseMemObject(d_indices); clReleaseMemObject(d_scores);
             break;
         }
         clFinish(q);
@@ -675,31 +645,26 @@ __kernel void compact_selected(
         if (h_selected > 0) {
             size_t selN = (size_t)h_selected;
             std::vector<int> h_scores_sel(selN);
-            std::vector<unsigned long long> h_indices_sel(selN);
-            clEnqueueReadBuffer(q, d_comp_scores, CL_TRUE, 0, sizeof(int) * selN, h_scores_sel.data(), 0, nullptr, nullptr);
-            clEnqueueReadBuffer(q, d_comp_indices, CL_TRUE, 0, sizeof(unsigned long long) * selN, h_indices_sel.data(), 0, nullptr, nullptr);
+            std::vector<unsigned long long> h_indices_sel(selN * slots_per_sol);
+            clEnqueueReadBuffer(q, d_comp_scores,  CL_TRUE, 0, sizeof(int) * selN, h_scores_sel.data(), 0, nullptr, nullptr);
+            clEnqueueReadBuffer(q, d_comp_indices, CL_TRUE, 0,
+                sizeof(unsigned long long) * selN * slots_per_sol, h_indices_sel.data(), 0, nullptr, nullptr);
             clFinish(q);
 
             for (size_t i = 0; i < selN; ++i) {
                 int sc = h_scores_sel[i];
                 if (sc < 0) continue;
-                if (topk.size() < (size_t)max_solutions) { 
-                    topk.push(Item{sc, h_indices_sel[i]}); 
-                }
-                else if (sc > topk.top().score) { 
-                    topk.pop(); 
-                    topk.push(Item{sc, h_indices_sel[i]});
-                }
+                Item it; it.score = sc; it.slot_count = slots_per_sol;
+                for (int s = 0; s < slots_per_sol && s < 3; ++s)
+                    it.slots[s] = h_indices_sel[i * slots_per_sol + s];
+                if (topk.size() < (size_t)max_solutions) topk.push(it);
+                else if (sc > topk.top().score) { topk.pop(); topk.push(it); }
             }
         }
 
-        clReleaseMemObject(d_comp_indices);
-        clReleaseMemObject(d_comp_scores);
+        clReleaseMemObject(d_comp_indices); clReleaseMemObject(d_comp_scores);
         clReleaseMemObject(d_selected_count);
-        clReleaseMemObject(d_flags);
-        clReleaseMemObject(d_indices);
-        clReleaseMemObject(d_scores);
-
+        clReleaseMemObject(d_flags); clReleaseMemObject(d_indices); clReleaseMemObject(d_scores);
         processed += batch;
     }
 
@@ -707,9 +672,10 @@ __kernel void compact_selected(
     while (!topk.empty()) { items.push_back(topk.top()); topk.pop(); }
     std::sort(items.begin(), items.end(), [](const Item& a, const Item& b){ return a.score > b.score; });
     int out_count = (int)std::min(items.size(), (size_t)max_solutions);
-    for (int i = 0; i < out_count; ++i) { 
-        result_scores[i] = items[i].score; 
-        result_indices[i] = (long long)items[i].idx; 
+    for (int i = 0; i < out_count; ++i) {
+        result_scores[i] = items[i].score;
+        for (int s = 0; s < items[i].slot_count && s < 3; ++s)
+            result_indices[i * slots_per_sol + s] = (long long)items[i].slots[s];
     }
 
     if (d_min_vals) clReleaseMemObject(d_min_vals);
@@ -738,15 +704,16 @@ std::vector<ModuleSolution> ModuleOptimizerCpp::StrategyEnumerationOpenCL(
     const std::unordered_set<int>& exclude_attributes,
     const std::unordered_map<int, int>& min_attr_sum_requirements,
     int max_solutions,
-    int max_workers) {
+    int max_workers,
+    int combo_size) {
 #ifdef USE_OPENCL
     if (!TestOpenCL()) {
         printf("OpenCL not available, using CPU optimized version\n");
         return StrategyEnumeration(modules, target_attributes, exclude_attributes,
-                                   min_attr_sum_requirements, max_solutions, max_workers);
+                                   min_attr_sum_requirements, max_solutions, max_workers, combo_size);
     }
 
-    printf("OpenCL GPU acceleration enabled - all calculations performed on GPU\n");
+    printf("OpenCL GPU acceleration enabled (combo_size=%d)\n", combo_size);
 
     std::vector<int> all_attr_ids;
     std::vector<int> all_attr_values;
@@ -773,8 +740,9 @@ std::vector<ModuleSolution> ModuleOptimizerCpp::StrategyEnumerationOpenCL(
         min_attr_values.push_back(kv.second);
     }
 
+    int slots_per_sol = (combo_size + 3) / 4;  // ceil(combo_size/4)
     std::vector<int> gpu_scores(max_solutions);
-    std::vector<long long> gpu_indices(max_solutions);
+    std::vector<long long> gpu_indices(static_cast<size_t>(max_solutions) * slots_per_sol);
 
     int gpu_result_count = 0;
 #ifdef USE_OPENCL
@@ -792,6 +760,7 @@ std::vector<ModuleSolution> ModuleOptimizerCpp::StrategyEnumerationOpenCL(
         min_attr_ids.empty() ? nullptr : min_attr_ids.data(),
         min_attr_values.empty() ? nullptr : min_attr_values.data(),
         static_cast<int>(min_attr_ids.size()),
+        combo_size,
         max_solutions,
         gpu_scores.data(),
         gpu_indices.data());
@@ -800,23 +769,44 @@ std::vector<ModuleSolution> ModuleOptimizerCpp::StrategyEnumerationOpenCL(
     std::vector<ModuleSolution> final_solutions;
     final_solutions.reserve(static_cast<size_t>(gpu_result_count));
     for (int i = 0; i < gpu_result_count; ++i) {
-        long long packed = gpu_indices[i];
         std::vector<ModuleInfo> solution_modules;
-        solution_modules.reserve(4);
-        for (int j = 0; j < 4; ++j) {
-            size_t module_idx = static_cast<size_t>((packed >> (j * 16)) & 0xFFFF);
-            if (module_idx < modules.size()) {
-                solution_modules.push_back(modules[module_idx]);
+        std::vector<size_t> solution_indices;
+        solution_indices.reserve(static_cast<size_t>(combo_size));
+        // 按 slots_per_sol 解包索引
+        for (int slot = 0; slot < slots_per_sol; ++slot) {
+            long long packed = gpu_indices[static_cast<size_t>(i) * slots_per_sol + slot];
+            int in_slot = std::min(4, combo_size - slot * 4);
+            for (int j = 0; j < in_slot; ++j) {
+                size_t module_idx = static_cast<size_t>((packed >> (j * 16)) & 0xFFFF);
+                if (module_idx < modules.size()) {
+                    solution_modules.push_back(modules[module_idx]);
+                    solution_indices.push_back(module_idx);
+                }
             }
         }
+        if (static_cast<int>(solution_modules.size()) != combo_size ||
+            static_cast<int>(solution_indices.size()) != combo_size) {
+            continue;
+        }
+        int exact_score = CalculateCombatPowerByIndices(
+            solution_indices, modules, target_attributes, exclude_attributes);
         auto result = CalculateCombatPower(solution_modules);
-        final_solutions.emplace_back(solution_modules, gpu_scores[i], result.second);
+        if (exact_score != gpu_scores[i]) {
+            printf("OpenCL score mismatch: gpu=%d cpu=%d (solution #%d)\n",
+                   gpu_scores[i], exact_score, i);
+        }
+        final_solutions.emplace_back(solution_modules, exact_score, result.second);
     }
+    std::sort(final_solutions.begin(), final_solutions.end(),
+              [](const ModuleSolution& a, const ModuleSolution& b) {
+                  return a.score > b.score;
+              });
     return final_solutions;
 #else
-    (void)modules; (void)target_attributes; (void)exclude_attributes; (void)min_attr_sum_requirements; (void)max_solutions; (void)max_workers;
+    (void)modules; (void)target_attributes; (void)exclude_attributes;
+    (void)min_attr_sum_requirements; (void)max_solutions; (void)max_workers; (void)combo_size;
     return StrategyEnumeration(modules, target_attributes, exclude_attributes,
-                               min_attr_sum_requirements, max_solutions, max_workers);
+                               min_attr_sum_requirements, max_solutions, max_workers, combo_size);
 #endif
 }
 

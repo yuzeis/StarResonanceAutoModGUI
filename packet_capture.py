@@ -1,472 +1,389 @@
-"""
-网络抓包模块
-"""
+# -*- coding: utf-8 -*-
+"""网络抓包模块 — TCP 重组、游戏协议解析、事件驱动输出
 
-import io
-import socket
+兼容层说明：
+- 保留新版游标化缓冲/TCP 重传保护/Event 停机等实现
+- 适配原工程 start_capture(callback) 调用方式
+- 内置 PacketReader / zstd_decompress，避免额外依赖 proto_reader/zstd_utils/scapy_minimal
+- 对 SyncContainerData 自动解析后继续通过 callback({'v_data': ...}) 传回上层
+"""
+from __future__ import annotations
+
+import logging
+import queue
 import struct
 import threading
 import time
-import logging
+from dataclasses import dataclass
 from typing import Optional, Callable, Dict, Any
-from scapy.all import sniff, IP, TCP, UDP, Raw
+
+from scapy.all import sniff, IP, TCP, Raw  # type: ignore
 import zstandard as zstd
-import json
-from BlueProtobuf_pb2 import SyncContainerData, CharSerialize, ItemPackage, Package, Item, ModNewAttr
-from logging_config import get_logger
-from module_parser import ModuleParser
+from BlueProtobuf_pb2 import SyncContainerData
+from notify_dumper import NotifyDumper
 
-logger = get_logger(__name__)
+log = logging.getLogger(__name__)
+
+_STOP_SENTINEL = object()
+_U16 = struct.Struct('>H')
+_U32 = struct.Struct('>I')
+_U64 = struct.Struct('>Q')
+
+_SERVER_SIG = b"\x00\x63\x33\x53\x42\x00"
+_LOGIN_RESP_HEAD = b"\x00\x00\x00\x62\x00\x03\x00\x00\x00\x01"
+_LOGIN_RESP_TAIL = b"\x00\x00\x00\x00\x0a\x4e"
+_MSG_NOTIFY = 2
+_MSG_RESPONSE = 3
+_MSG_FRAMEDOWN = 6
+_COMPRESS_FLAG = 0x8000
+_GAME_SERVICE_UUID = 0x0000000063335342
+_SYNC_CONTAINER_DATA_METHOD = 0x00000015
 
 
-class BinaryReader:
-    """二进制数据读取器"""
-    
-    def __init__(self, buffer: bytes, offset: int = 0):
-        self.buffer = buffer
+def zstd_decompress(data: bytes, max_output_size: int = 1024 * 1024) -> bytes | None:
+    try:
+        dctx = zstd.ZstdDecompressor()
+        return dctx.decompress(data, max_output_size=max_output_size)
+    except Exception:
+        return None
+
+
+class PacketReader:
+    __slots__ = ('buf', 'offset', 'end')
+
+    def __init__(self, buf: bytes | bytearray, offset: int = 0, end: int | None = None):
+        self.buf = buf
         self.offset = offset
-        
-    def readUInt64(self) -> int:
-        """读取64位无符号整数(大端序)"""
-        value = struct.unpack('>Q', self.buffer[self.offset:self.offset + 8])[0]
-        self.offset += 8
-        return value
-        
-    def readUInt32(self) -> int:
-        """读取32位无符号整数(大端序)"""
-        value = struct.unpack('>I', self.buffer[self.offset:self.offset + 4])[0]
-        self.offset += 4
-        return value
-        
-    def peekUInt32(self) -> int:
-        """查看32位无符号整数(大端序)，不推进偏移量"""
-        return struct.unpack('>I', self.buffer[self.offset:self.offset + 4])[0]
-        
-    def readUInt16(self) -> int:
-        """读取16位无符号整数(大端序)"""
-        value = struct.unpack('>H', self.buffer[self.offset:self.offset + 2])[0]
-        self.offset += 2
-        return value
-        
-    def readBytes(self, length: int) -> bytes:
-        """读取指定长度的字节"""
-        value = self.buffer[self.offset:self.offset + length]
-        self.offset += length
-        return value
-        
+        self.end = len(buf) if end is None else min(end, len(buf))
+
+    @property
     def remaining(self) -> int:
-        """返回剩余字节数"""
-        return len(self.buffer) - self.offset
-        
-    def readRemaining(self) -> bytes:
-        """读取剩余的所有字节"""
-        value = self.buffer[self.offset:]
-        self.offset = len(self.buffer)
-        return value
+        return self.end - self.offset
+
+    def peek_u32(self) -> int:
+        if self.remaining < 4:
+            raise ValueError('not enough bytes for u32')
+        return _U32.unpack_from(self.buf, self.offset)[0]
+
+    def read_u16(self) -> int:
+        if self.remaining < 2:
+            raise ValueError('not enough bytes for u16')
+        val = _U16.unpack_from(self.buf, self.offset)[0]
+        self.offset += 2
+        return val
+
+    def read_u32(self) -> int:
+        if self.remaining < 4:
+            raise ValueError('not enough bytes for u32')
+        val = _U32.unpack_from(self.buf, self.offset)[0]
+        self.offset += 4
+        return val
+
+    def read_u64(self) -> int:
+        if self.remaining < 8:
+            raise ValueError('not enough bytes for u64')
+        val = _U64.unpack_from(self.buf, self.offset)[0]
+        self.offset += 8
+        return val
+
+    def read_bytes(self, n: int) -> bytes:
+        if n < 0 or self.remaining < n:
+            raise ValueError('not enough bytes')
+        start = self.offset
+        self.offset += n
+        return bytes(self.buf[start:self.offset])
+
+    def read_remaining(self) -> bytes:
+        return self.read_bytes(self.remaining)
+
+    def sub_reader(self, length: int) -> 'PacketReader':
+        if length < 0 or self.remaining < length:
+            raise ValueError('sub_reader out of bounds')
+        start = self.offset
+        self.offset += length
+        return PacketReader(self.buf, start, start + length)
+
+
+@dataclass(slots=True)
+class PacketEvent:
+    kind: str
+    stream_id: str = ''
+    service_uuid: int = 0
+    stub_id: int = 0
+    method_id: int = 0
+    server_sequence_id: int = 0
+    raw_payload: bytes = b''
 
 
 class PacketCapture:
-    """网络数据包抓取器"""
-    
-    def __init__(self, interface: str = None):
-        """
-        初始化抓包器
-        
-        Args:
-            interface: 网络接口名称, None表示自动选择
-        """
+    FRAGMENT_TIMEOUT = 30
+    MAX_PACKET_SIZE = 0x0FFFFF
+    MAX_CACHE_ENTRIES = 1024
+    MAX_FRAMEDOWN_DEPTH = 16
+
+    def __init__(self, interface: str | None = None, *, dump_enabled: bool = False):
         self.interface = interface
         self.is_running = False
-        self.callback = None
+        self.callback: Optional[Callable[[Dict[str, Any]], None]] = None
+        self.event_queue: queue.Queue = queue.Queue(maxsize=4096)
         self.packet_count = 0
         self.sync_container_count = 0
-        
+        self.events_produced = 0
+        self.events_dropped = 0
         self.current_server = ''
-        self.tcp_cache = {}
-        self.tcp_next_seq = -1
-        self.tcp_last_time = 0
-        self.tcp_lock = threading.Lock()
-        self._data = b''
 
-        self.module_parser = ModuleParser()
-        
-    def start_capture(self, callback: Callable[[Dict[str, Any]], None] = None):
-        """
-        开始抓包
-        
-        Args:
-            callback: 数据包处理回调函数
-        """
+        self._buf = bytearray()
+        self._buf_offset = 0
+        self._tcp_cache: dict[int, bytes] = {}
+        self._next_seq = -1
+        self._last_time = 0.0
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._dumper = NotifyDumper(enabled=dump_enabled)
+
+    def __enter__(self) -> 'PacketCapture':
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.stop_capture()
+        self.cleanup()
+
+    def start_capture(self, callback: Optional[Callable[[Dict[str, Any]], None]] = None) -> None:
         self.callback = callback
         self.is_running = True
-        
-        logger.info(f"开始抓包，接口: {self.interface or '自动'}")
-        
-        # 在新线程中运行抓包
-        capture_thread = threading.Thread(target=self._capture_loop)
-        capture_thread.daemon = True
-        capture_thread.start()
-        
-        # 启动定时清理线程
-        cleanup_thread = threading.Thread(target=self._cleanup_loop)
-        cleanup_thread.daemon = True
-        cleanup_thread.start()
-        
-    def stop_capture(self):
-        """停止抓包"""
-        self.is_running = False
-        logger.info("停止抓包")
-        
-    def _capture_loop(self):
-        """抓包主循环"""
-        try:
-            # 使用scapy进行抓包
-            sniff(
-                iface=self.interface,
-                prn=self._process_packet,
-                store=0,
-                stop_filter=lambda _: not self.is_running
-            )
-        except Exception as e:
-            logger.error(f"抓包过程中发生错误: {e}")
-            
-    def _process_packet(self, packet):
-        """处理单个数据包"""
+        self._stop_event.clear()
+        log.info('开始抓包: iface=%s', self.interface)
+        threading.Thread(target=self._capture_loop, daemon=True).start()
+        threading.Thread(target=self._cleanup_loop, daemon=True).start()
+
+    def stop_capture(self) -> None:
         if not self.is_running:
             return
-            
-        self.packet_count += 1
-        
+        self.is_running = False
+        self._stop_event.set()
         try:
-            # 检查是否是TCP包
-            if TCP in packet and IP in packet:
-                self._process_tcp_packet(packet)
+            self.event_queue.put_nowait(_STOP_SENTINEL)
+        except queue.Full:
+            pass
+        log.info('停止抓包: packets=%d sync=%d events=%d dropped=%d',
+                 self.packet_count, self.sync_container_count,
+                 self.events_produced, self.events_dropped)
+
+    def cleanup(self) -> None:
+        self._dumper.cleanup()
+
+    def get_event(self, timeout: float = 0.2) -> PacketEvent | None:
+        try:
+            obj = self.event_queue.get(timeout=timeout)
+            if obj is _STOP_SENTINEL:
+                return None
+            return obj
+        except queue.Empty:
+            return None
+
+    def stats_summary(self) -> str:
+        return (f'packets={self.packet_count} sync={self.sync_container_count} '
+                f'events={self.events_produced} dropped={self.events_dropped} '
+                f'qsize={self.event_queue.qsize()}')
+
+    def _capture_loop(self) -> None:
+        try:
+            sniff(
+                iface=self.interface,
+                prn=self._on_packet,
+                store=0,
+                stop_filter=lambda _: not self.is_running,
+            )
         except Exception as e:
-            logger.debug(f"处理数据包时发生错误: {e}")
-            
-    def _process_tcp_packet(self, packet):
-        """处理TCP数据包"""
-        # 获取IP和TCP信息
-        ip_layer = packet[IP]
-        tcp_layer = packet[TCP]
-        
-        src_addr = ip_layer.src
-        dst_addr = ip_layer.dst
-        src_port = tcp_layer.sport
-        dst_port = tcp_layer.dport
-        seq = tcp_layer.seq
-        ack = tcp_layer.ack
-        
-        # 构建服务器标识
-        src_server = f"{src_addr}:{src_port} -> {dst_addr}:{dst_port}"
-        
-        # 获取TCP负载
-        if Raw in packet:
-            payload = bytes(packet[Raw])
-            self._process_tcp_stream(src_server, seq, payload)
-            
-    def _process_tcp_stream(self, src_server: str, seq: int, payload: bytes):
-        """处理TCP流数据"""
-        with self.tcp_lock:
-            # 服务器识别逻辑
-            if self.current_server != src_server:
+            log.error('抓包循环异常退出: %s', e, exc_info=True)
+
+    def _on_packet(self, pkt) -> None:
+        if not self.is_running or TCP not in pkt or IP not in pkt or Raw not in pkt:
+            return
+        self.packet_count += 1
+        ip, tcp = pkt[IP], pkt[TCP]
+        stream = f'{ip.src}:{tcp.sport} -> {ip.dst}:{tcp.dport}'
+        try:
+            self._feed_tcp(stream, tcp.seq, bytes(pkt[Raw]))
+        except Exception as e:
+            log.debug('处理数据包异常: %s', e, exc_info=True)
+
+    def _feed_tcp(self, stream: str, seq: int, payload: bytes) -> None:
+        with self._lock:
+            if self.current_server != stream:
+                if self.current_server:
+                    return
                 if self._identify_game_server(payload):
-                    self.current_server = src_server
-                    self._clear_tcp_cache()
-                    self.tcp_next_seq = seq + len(payload)
-                    logger.info(f'识别到游戏服务器: {src_server}')
+                    log.info('识别到游戏服务器: %s', stream)
+                    self.current_server = stream
+                    self._reset_buf()
+                    self._next_seq = (seq + len(payload)) & 0xFFFFFFFF
+                return
+
+            if self._next_seq == -1:
+                if len(payload) > 4 and _U32.unpack_from(payload, 0)[0] < self.MAX_PACKET_SIZE:
+                    self._next_seq = seq
                 else:
-                    return  # 不是游戏服务器，跳过
-            
-            # 如果还没有识别到服务器，跳过
-            if not self.current_server:
+                    return
+
+            diff = (seq - self._next_seq) & 0xFFFFFFFF
+            if diff >= 0x80000000:
                 return
-                
-            # TCP流重组逻辑
-            if self.tcp_next_seq == -1:
-                logger.error('TCP流重组错误: tcp_next_seq 为 -1')
-                if len(payload) > 4 and struct.unpack('>I', payload[:4])[0] < 0x0fffff:
-                    self.tcp_next_seq = seq
-                return
-                
-            # 缓存数据包
-            if (self.tcp_next_seq - seq) <= 0 or self.tcp_next_seq == -1:
-                self.tcp_cache[seq] = payload
-                
-            # 按顺序处理数据包
-            while self.tcp_next_seq in self.tcp_cache:
-                seq = self.tcp_next_seq
-                cached_data = self.tcp_cache[seq]
-                self._data = self._data + cached_data if self._data else cached_data
-                self.tcp_next_seq = (seq + len(cached_data)) & 0xffffffff
-                del self.tcp_cache[seq]
-                self.tcp_last_time = time.time()
-                
-            # 处理完整的数据包
-            self._process_complete_packets()
-            
+
+            if seq not in self._tcp_cache:
+                if len(self._tcp_cache) < self.MAX_CACHE_ENTRIES:
+                    self._tcp_cache[seq] = payload
+                else:
+                    log.debug('TCP cache 已满, 丢弃 seq=%d', seq)
+
+            while self._next_seq in self._tcp_cache:
+                chunk = self._tcp_cache.pop(self._next_seq)
+                self._buf.extend(chunk)
+                self._next_seq = (self._next_seq + len(chunk)) & 0xFFFFFFFF
+                self._last_time = time.time()
+
+            self._consume_packets()
+
+    def _reset_buf(self) -> None:
+        self._buf.clear()
+        self._buf_offset = 0
+        self._next_seq = -1
+        self._last_time = 0.0
+        self._tcp_cache.clear()
+
+    def _consume_packets(self) -> None:
+        buf = self._buf
+        offset = self._buf_offset
+        while len(buf) - offset > 4:
+            pkt_size = _U32.unpack_from(buf, offset)[0]
+            if pkt_size < 6 or pkt_size > self.MAX_PACKET_SIZE:
+                break
+            if len(buf) - offset < pkt_size:
+                break
+            self._parse_game_packet(buf, offset, pkt_size)
+            offset += pkt_size
+        self._buf_offset = offset
+        if self._buf_offset > len(self._buf) // 2:
+            del self._buf[:self._buf_offset]
+            self._buf_offset = 0
+
     def _identify_game_server(self, payload: bytes) -> bool:
-        """识别游戏服务器"""
         if len(payload) < 10:
             return False
-            
+        if (len(payload) == 0x62
+                and payload[:10] == _LOGIN_RESP_HEAD
+                and payload[14:20] == _LOGIN_RESP_TAIL):
+            return True
+        if payload[4] != 0:
+            return False
         try:
-            if payload[4] == 0:
-                data = payload[10:]
-                if data:
-                    # 检查游戏服务器签名
-                    signature = b'\x00\x63\x33\x53\x42\x00'
-                    stream = io.BytesIO(data)
-                    while True:
-                        # 读4字节长度
-                        len_buf = stream.read(4)
-                        if len(len_buf) < 4:
-                            break
-                        length = int.from_bytes(len_buf, byteorder="big")
-
-                        # 读实际数据
-                        data1 = stream.read(length - 4)
-                        if not data1:
-                            break
-
-                        # 检查签名
-                        if data1[5:5+len(signature)] == signature:
-                            return True
-                        
-            if len(payload) == 0x62:
-                # 检查登录返回包特征
-                signature = b'\x00\x00\x00\x62\x00\x03\x00\x00\x00\x01'
-                if payload[:10] == signature and payload[14:20] == b'\x00\x00\x00\x00\x0a\x4e':
+            reader = PacketReader(payload, 10)
+            while reader.remaining >= 4:
+                length = reader.read_u32()
+                if length < 4 or length > self.MAX_PACKET_SIZE:
+                    return False
+                data = reader.read_bytes(length - 4)
+                if len(data) >= 11 and data[5:11] == _SERVER_SIG:
                     return True
-                    
-        except Exception as e:
-            logger.debug(f"服务器识别失败: {e}")
-            
+        except (ValueError, IndexError):
+            pass
         return False
-        
-    def _clear_tcp_cache(self):
-        """清理TCP缓存"""
-        self._data = b''
-        self.tcp_next_seq = -1
-        self.tcp_last_time = 0
-        self.tcp_cache.clear()
-        
-    def _process_complete_packets(self):
-        """处理完整的数据包"""
-        while len(self._data) > 4:
-            try:
-                packet_size = struct.unpack('>I', self._data[:4])[0]
-                
-                if len(self._data) < packet_size:
-                    break
-                    
-                if packet_size > 0x0fffff:
-                    logger.error(f"无效的数据包长度: {packet_size}")
-                    break
-                    
-                # 提取完整数据包
-                packet = self._data[:packet_size]
-                self._data = self._data[packet_size:]
-                
-                # 分析数据包负载
-                self._analyze_payload(packet, "TCP")
-                
-            except Exception as e:
-                logger.debug(f"处理完整数据包失败: {e}")
-                break
-            
-    def _analyze_payload(self, payload: bytes, protocol: str):
-        """分析数据包负载"""
-        if len(payload) < 4:
-            return
-            
-        try:
-            # 尝试解析为SyncContainerData
-            parsed_data = self._parse_sync_container_data(payload)
-            if parsed_data:
-                self.sync_container_count += 1
-                logger.debug(f"发现SyncContainerData数据包 #{self.sync_container_count}")
-                
-                if self.callback:
-                    self.callback(parsed_data)
-                    
-        except Exception as e:
-            logger.debug(f"解析数据包失败: {e}")
-            
-    def _parse_sync_container_data(self, payload: bytes) -> Optional[Dict[str, Any]]:
-        """
-        解析SyncContainerData数据包
-        
-        Args:
-            payload: 原始数据包负载
-            
-        Returns:
-            解析后的数据, 如果不是SyncContainerData则返回None
-        """
-        try:
-            # 使用BinaryReader进行流式读取
-            packets_reader = BinaryReader(payload)
-            
-            # 处理多个数据包
-            while packets_reader.remaining() > 0:
-                packet_size = packets_reader.peekUInt32()
-                if packet_size < 6:
-                    logger.debug("收到无效数据包")
-                    return None
-                    
-                # 读取完整数据包
-                packet_data = packets_reader.readBytes(packet_size)
-                packet_reader = BinaryReader(packet_data)
-                
-                # 读取包长度和包类型
-                packet_size = packet_reader.readUInt32()
-                packet_type = packet_reader.readUInt16()
-                
-                # 解析包类型
-                is_zstd_compressed = (packet_type & 0x8000) != 0
-                msg_type_id = packet_type & 0x7fff
-                
-                # 根据消息类型处理
-                if msg_type_id == 2:  # Notify
-                    result = self._process_notify_msg(packet_reader, is_zstd_compressed)
-                    if result:
-                        return result
-                elif msg_type_id == 6:  # FrameDown
-                    result = self._process_frame_down_msg(packet_reader, is_zstd_compressed)
-                    if result:
-                        return result
-                        
-        except Exception as e:
-            logger.debug(f"解析SyncContainerData失败: {e}")
-            
-        return None
-        
-    def _process_notify_msg(self, reader: BinaryReader, is_zstd_compressed: bool) -> Optional[Dict[str, Any]]:
-        """处理Notify消息, 使用流式读取"""
-        try:
-            # 读取serviceUuid, stubId, methodId
-            service_uuid = reader.readUInt64()
-            stub_id = reader.readUInt32()
-            method_id = reader.readUInt32()
-            
-            # 检查serviceUuid是否为游戏服务器标识
-            GAME_SERVICE_UUID = 0x0000000063335342
-            if service_uuid != GAME_SERVICE_UUID:
-                logger.debug(f"跳过serviceId为 {service_uuid} 的NotifyMsg")
-                return None
-                
-            logger.debug(f"methodId={method_id} isZstdCompressed={is_zstd_compressed}")
-            
-            # 读取剩余数据
-            msg_payload = reader.readRemaining()
-            
-            # 解压缩
-            if is_zstd_compressed:
-                try:
-                    dctx = zstd.ZstdDecompressor()
-                    msg_payload = dctx.decompress(msg_payload, max_output_size=1024*1024)
-                    logger.debug(f"Notify解压缩成功, 解压缩后数据长度: {len(msg_payload)}")
-                except Exception as e:
-                    logger.debug(f"Notify zstd解压缩失败: {e}")
-                    
-            # 根据methodId处理
-            SYNC_CONTAINER_DATA_METHOD = 0x00000015
-            SyncNearEntities = 0x00000006
-            SyncContainerDirtyData = 0x00000016
-            SyncNearDeltaInfo = 0x0000002d
-            SyncToMeDeltaInfo = 0x0000002e
-            
-            if method_id == SYNC_CONTAINER_DATA_METHOD:
-                logger.debug('SyncContainerData数据包')
-                logger.debug(f"发现SyncContainerData数据包 (serviceUuid: 0x{service_uuid:016x}, methodId: 0x{method_id:08x})")
-                
-                # 解析protobuf数据
-                sync_data = SyncContainerData()
-                sync_data.ParseFromString(msg_payload)
-                
-                # 通过回调函数传递数据，而不是直接处理
-                if self.callback:
-                    self.callback({'v_data': sync_data.VData})
 
+    def _parse_game_packet(self, buf: bytearray, start: int, size: int) -> None:
+        stack: list[tuple[bytes | bytearray, int, int]] = [(buf, start, size)]
+        depth = 0
+        while stack and depth < self.MAX_FRAMEDOWN_DEPTH:
+            cur_buf, cur_start, cur_size = stack.pop()
+            depth += 1
+            if cur_size < 6:
+                continue
+            reader = PacketReader(cur_buf, cur_start, cur_start + cur_size)
+            while reader.remaining >= 4:
+                pkt_size = reader.peek_u32()
+                if pkt_size < 6 or pkt_size > reader.remaining:
+                    break
+                pr = reader.sub_reader(pkt_size)
+                pr.read_u32()
+                pkt_type = pr.read_u16()
+                compressed = (pkt_type & _COMPRESS_FLAG) != 0
+                msg_type = pkt_type & 0x7FFF
+                if msg_type in (_MSG_NOTIFY, _MSG_RESPONSE, _MSG_FRAMEDOWN):
+                    nested = self._emit_event(pr, msg_type, compressed)
+                    if nested is not None:
+                        stack.append((nested, 0, len(nested)))
 
-            elif method_id == SyncNearEntities:
-                logger.debug("发现SyncNearEntities数据包")
-            elif method_id == SyncContainerDirtyData:
-                logger.debug("发现SyncContainerDirtyData数据包")
-            elif method_id == SyncNearDeltaInfo:
-                logger.debug("发现SyncNearDeltaInfo数据包")
-            elif method_id == SyncToMeDeltaInfo:
-                logger.debug("发现SyncToMeDeltaInfo数据包")
+    def _emit_event(self, reader: PacketReader, msg_type: int, compressed: bool) -> bytes | None:
+        try:
+            if msg_type == _MSG_NOTIFY:
+                svc = reader.read_u64()
+                stub = reader.read_u32()
+                method = reader.read_u32()
+                seq_id = 0
+            elif msg_type == _MSG_RESPONSE:
+                seq_id = reader.read_u32()
+                svc = reader.read_u32()
+                stub = reader.read_u32()
+                method = 0
             else:
-                logger.debug(f"跳过methodId为 {method_id} 的NotifyMsg")
-                
-        except Exception as e:
-            logger.debug(f"处理Notify消息失败: {e}")
-            
-        return None
-        
-    def _process_frame_down_msg(self, reader: BinaryReader, is_zstd_compressed: bool) -> Optional[Dict[str, Any]]:
-        """处理FrameDown消息, 使用流式读取"""
-        try:
-            # 读取服务器序列号
-            server_sequence_id = reader.readUInt32()
-            
-            if reader.remaining() == 0:
-                return None
-                
-            # 读取嵌套数据包
-            nested_packet = reader.readRemaining()
-            
-            # 解压缩
-            if is_zstd_compressed:
-                try:
-                    dctx = zstd.ZstdDecompressor()
-                    nested_packet = dctx.decompress(nested_packet, max_output_size=1024*1024)
-                    logger.debug(f"FrameDown解压缩成功, 解压缩后数据长度: {len(nested_packet)}")
-                except Exception as e:
-                    logger.debug(f"FrameDown zstd解压缩失败: {e}")
-                    # 继续处理原始数据
-                    
-            logger.debug(f"处理FrameDown嵌套数据包, 服务器序列号: {server_sequence_id}")
-            
-            # 递归处理嵌套数据包
-            return self._parse_sync_container_data(nested_packet)
-            
-        except Exception as e:
-            logger.debug(f"处理FrameDown消息失败: {e}")
-            
-        return None
+                svc = stub = method = 0
+                seq_id = reader.read_u32()
+                if reader.remaining == 0:
+                    return None
 
-    def _cleanup_loop(self):
-        """定时清理循环"""
-        while self.is_running:
-            try:
-                time.sleep(10)  # 每10秒清理一次
-                self._cleanup_expired_cache()
-            except Exception as e:
-                logger.debug(f"清理缓存时发生错误: {e}")
-                
-    def _cleanup_expired_cache(self):
-        """清理过期的缓存"""
-        FRAGMENT_TIMEOUT = 30  # 30秒超时
-        
-        with self.tcp_lock:
-            current_time = time.time()
-            
-            # 清理过期的TCP缓存
-            expired_seqs = []
-            for seq in self.tcp_cache:
-                if current_time - self.tcp_last_time > FRAGMENT_TIMEOUT:
-                    expired_seqs.append(seq)
-                    
-            for seq in expired_seqs:
-                del self.tcp_cache[seq]
-                
-            if expired_seqs:
-                logger.debug(f"清理了 {len(expired_seqs)} 个过期的TCP缓存项")
-                
-            # 检查连接超时
-            if self.tcp_last_time and current_time - self.tcp_last_time > FRAGMENT_TIMEOUT:
-                logger.warning('无法捕获下一个数据包! 游戏是否已关闭或断开连接?seq: ' + str(self.tcp_next_seq))
-                self.current_server = ''
-                self._clear_tcp_cache()
+            raw = reader.read_remaining()
+            final = self._decompress_and_dump(raw, compressed)
+            if final is None:
+                return None
+
+            kind = 'Notify' if msg_type == _MSG_NOTIFY else ('Response' if msg_type == _MSG_RESPONSE else 'FrameDown')
+            evt = PacketEvent(kind=kind, stream_id=self.current_server,
+                              service_uuid=svc, stub_id=stub, method_id=method,
+                              server_sequence_id=seq_id, raw_payload=final)
+            self._push_event(evt)
+            if msg_type == _MSG_NOTIFY:
+                self._maybe_dispatch_sync_container(evt)
+            return final if msg_type == _MSG_FRAMEDOWN else None
+        except Exception as e:
+            log.debug('解析 msg_type=%d 异常: %s', msg_type, e, exc_info=True)
+            return None
+
+    def _decompress_and_dump(self, raw: bytes, compressed: bool) -> bytes | None:
+        if compressed:
+            dec = zstd_decompress(raw)
+            if dec is None:
+                log.warning('标记为压缩但解压失败, 丢弃 (%d bytes)', len(raw))
+                return None
+            self._dumper.dump(raw, dec)
+            return dec
+        self._dumper.dump(raw)
+        return raw
+
+    def _push_event(self, evt: PacketEvent) -> None:
+        self.events_produced += 1
+        try:
+            self.event_queue.put_nowait(evt)
+        except queue.Full:
+            self.events_dropped += 1
+            if self.events_dropped % 100 == 1:
+                log.warning('事件队列已满, 累计丢弃 %d 事件', self.events_dropped)
+
+    def _maybe_dispatch_sync_container(self, evt: PacketEvent) -> None:
+        if evt.service_uuid != _GAME_SERVICE_UUID or evt.method_id != _SYNC_CONTAINER_DATA_METHOD:
+            return
+        try:
+            sync_data = SyncContainerData()
+            sync_data.ParseFromString(evt.raw_payload)
+            self.sync_container_count += 1
+            if self.callback:
+                self.callback({'v_data': sync_data.VData})
+        except Exception as e:
+            log.debug('解析 SyncContainerData 失败: %s', e, exc_info=True)
+
+    def _cleanup_loop(self) -> None:
+        while not self._stop_event.wait(10):
+            log.debug('stats: %s', self.stats_summary())
+            with self._lock:
+                if self._last_time and time.time() - self._last_time > self.FRAGMENT_TIMEOUT:
+                    log.info('TCP 流超时，重置: %s', self.current_server)
+                    self.current_server = ''
+                    self._reset_buf()

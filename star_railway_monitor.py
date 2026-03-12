@@ -44,7 +44,8 @@ class StarResonanceMonitor:
     
     def __init__(self, interface_index: int = None, category: str = "全部", attributes: List[str] = None, 
                  exclude_attributes: List[str] = None, match_count: int = 1, enumeration_mode: bool = False,
-                 min_attr_sum: dict | None = None, lang: str = 'zh'):
+                 min_attr_sum: dict | None = None, lang: str = 'zh',
+                 combo_size: int = 4, compute_mode: str = 'cpu'):
         """
         初始化监控器
         
@@ -65,6 +66,8 @@ class StarResonanceMonitor:
         self.min_attr_sum = min_attr_sum or {}
         self.enumeration_mode = enumeration_mode
         self.lang = (lang or 'zh').lower()
+        self.combo_size = max(1, min(10, int(combo_size)))
+        self.compute_mode = (compute_mode or 'cpu').lower()
         self.is_running = False
         
         # 获取网络接口信息
@@ -154,7 +157,9 @@ class StarResonanceMonitor:
                     exclude_attributes=self.exclude_attributes,
                     match_count=self.match_count,
                     enumeration_mode=self.enumeration_mode,
-                    min_attr_sum=self.min_attr_sum
+                    min_attr_sum=self.min_attr_sum,
+                    combo_size=self.combo_size,
+                    compute_mode=self.compute_mode
                 )
                     
         except Exception as e:
@@ -182,6 +187,11 @@ def main():
                        help='强制某属性在4件套总和≥VALUE。可多次使用，如：-mas 暴击专注 8 -mas 智力加持 12')
     parser.add_argument('--enumeration-mode', '-enum', action='store_true',
                        help='启用枚举模式, 直接使用枚举运算')
+    parser.add_argument('--combo-size', '-cs', type=int, default=4,
+                       help='组合件数（1~10，默认4）')
+    parser.add_argument('--compute-mode', '-cm', type=str, default='cpu',
+                       choices=['cpu', 'cuda', 'opencl'],
+                       help='计算模式：cpu / cuda / opencl（默认cpu）')
     parser.add_argument('--lang', '-lang', type=str, default='zh', help='输出语言: zh 或 en (默认: zh)')
     parser.add_argument('--load-vdata', '-lv', action='store_true',
                        help='从可执行文件目录读取 modules.vdata, 跳过抓包直接运算')
@@ -233,7 +243,9 @@ def main():
                 exclude_attributes=exclude_attributes_cn,
                 match_count=args.match_count,
                 enumeration_mode=args.enumeration_mode,
-                min_attr_sum=min_attr_sum
+                min_attr_sum=min_attr_sum,
+                combo_size=args.combo_size,
+                compute_mode=args.compute_mode
             )
         except SystemExit:
             raise
@@ -304,7 +316,9 @@ def main():
         match_count=args.match_count,
         enumeration_mode=args.enumeration_mode,
         min_attr_sum=min_attr_sum,
-        lang=lang
+        lang=lang,
+        combo_size=args.combo_size,
+        compute_mode=args.compute_mode
     )
     
     try:

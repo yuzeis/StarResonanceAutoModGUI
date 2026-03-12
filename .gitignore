@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual Environment
+.venv/
+venv/
+env/
+
+# Build
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# PyInstaller / Nuitka / packaging
+*.spec
+*.build
+*.bak
+*.tmp
+
+# C / C++ / CUDA build outputs
+*.obj
+*.o
+*.pdb
+*.ilk
+*.lib
+*.exp
+*.dll
+*.so
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

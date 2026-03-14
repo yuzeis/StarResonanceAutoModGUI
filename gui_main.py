@@ -485,7 +485,7 @@ class BenchmarkDialog(QDialog):
         t = QLabel("⚡  计算后端基准测试")
         t.setStyleSheet(f"color:{ACCENT};font-size:16px;font-weight:700;")
         lay.addWidget(t)
-        d = QLabel(f"使用模拟数据测试各后端枚举组合速度（当前组合件数：{self._combo_size}），结果用于预估实际运算时间。")
+        d = QLabel(f"使用模拟数据测试各后端枚举组合速度（当前组合件数：{self._combo_size}）。\n每个后端：1次预热 + 多轮测量取中位数，结果用于预估实际运算时间。")
         d.setStyleSheet(f"color:{TEXT2};font-size:12px;"); d.setWordWrap(True)
         lay.addWidget(d)
 
@@ -580,9 +580,52 @@ class BenchmarkDialog(QDialog):
             modules.append(ModuleInfo(f"模组_{i:03d}", cfg, i+1, 4, parts))
         return modules
 
+    @staticmethod
+    def _calc_bench_n(combo_size: int) -> int:
+        """根据 combo_size 动态计算基准测试所需的模组数 N。
+
+        目标: C(N, k) 在 5000 万 ~ 1.2 亿之间。
+        原先目标 200-500 万对 GPU 后端来说太少（CUDA 十几毫秒就跑完，
+        kernel launch 和显存传输的固定开销占比过大导致结果波动 ±50%）。
+        抬高到 5000 万~1.2 亿后，CPU 约 1~3 秒，CUDA 约 0.3~0.8 秒，
+        再配合 warmup + 多轮取中位数即可获得稳定结果。
+        """
+        import math as _math
+        _TARGET_LO = 50_000_000
+        _TARGET_HI = 120_000_000
+        k = max(1, min(10, combo_size))
+        # k<=2 时 C(N,k) 增长慢，直接给大 N
+        if k == 1:
+            return 80_000_000   # C(N,1) = N，直接给 8000 万
+        if k == 2:
+            return 15000        # C(15000,2) = 112,492,500
+        # 二分搜索满足 C(N,k) ∈ [LO, HI] 的 N
+        lo, hi = k, 5000
+        best_n = k + 10
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            c = _math.comb(mid, k)
+            if c < _TARGET_LO:
+                lo = mid + 1
+            elif c > _TARGET_HI:
+                hi = mid - 1
+            else:
+                best_n = mid
+                break
+        else:
+            best_n = hi
+        return max(best_n, k + 5)
+
     def _worker(self):
-        """子线程：调用真实C++扩展计时，通过Signal回传结果"""
-        import math as _math, time as _time, sys, os
+        """子线程：调用真实C++扩展计时，通过Signal回传结果。
+
+        测试流程（每个后端）：
+          1. Warmup: 跑 1 次，丢弃结果（让 CPU 缓存/GPU 驱动预热）
+          2. Measure: 跑 N 次，取中位数
+             - 若单次 < 500ms，则 N=5（短运行波动大，多轮平滑）
+             - 若单次 ≥ 500ms，则 N=3（已经够稳定）
+        """
+        import math as _math, time as _time, sys, os, statistics as _stat
         _proj = os.path.dirname(os.path.abspath(__file__))
         if _proj not in sys.path:
             sys.path.insert(0, _proj)
@@ -596,8 +639,7 @@ class BenchmarkDialog(QDialog):
              "strategy_enumeration_opencl_cpp"),
         ]
 
-        # 构造测试模组，N=500 → C(500,4)=2,573,031,125组合，充分压测GPU性能
-        N_MODULES = 200
+        N_MODULES = self._calc_bench_n(self._combo_size)
         try:
             modules = self._make_bench_modules(N_MODULES)
         except Exception as e:
@@ -607,7 +649,9 @@ class BenchmarkDialog(QDialog):
         n = N_MODULES
         k = self._combo_size
         total_combos = _math.comb(n, k)
-        self._sig_log.emit(f"测试规模：{n} 个模组，C({n},{k}) = {total_combos:,} 组合")
+        self._sig_log.emit(
+            f"测试规模：{n} 个模组，C({n},{k}) = {total_combos:,} 组合"
+            f"（{total_combos/1e4:.0f} 万）")
 
         try:
             import cpp_extension.module_optimizer_cpp as _ext
@@ -615,8 +659,10 @@ class BenchmarkDialog(QDialog):
             self._sig_log.emit(f"[ERR] 加载C++扩展失败: {e}")
             self._sig_done.emit(); return
 
+        avail_count = sum(1 for _,_,a,_ in modes if a)
+        done_count  = 0
+
         for idx,(mid,lbl,avail,fn_name) in enumerate(modes):
-            self._sig_prog.emit(int(idx/3*85))
             if not avail:
                 self._sig_log.emit(f"{lbl}：不可用，跳过")
                 self._results[mid] = 0.0; continue
@@ -626,19 +672,47 @@ class BenchmarkDialog(QDialog):
                 self._sig_log.emit(f"{lbl}：函数 {fn_name} 不存在，跳过")
                 self._results[mid] = 0.0; continue
 
-            self._sig_log.emit(f"测试 {lbl}（{fn_name}）…")
+            self._sig_log.emit(f"测试 {lbl}…")
+
             try:
+                # ── Warmup（预热 CPU 缓存 / GPU 驱动，结果丢弃）──
+                self._sig_log.emit(f"  [{lbl}] warmup…")
+                fn(modules, set(), set(), {}, 60, 8, k)
+
+                # ── Probe：跑 1 次测实际耗时，决定后续轮数 ──
                 t0 = _time.perf_counter()
                 fn(modules, set(), set(), {}, 60, 8, k)
-                elapsed = _time.perf_counter() - t0
-                # 万组合/秒
-                ops = (total_combos / elapsed) / 10000.0
-                self._sig_speed.emit(mid, ops)
+                probe_elapsed = _time.perf_counter() - t0
+
+                # 单次 < 500ms → 波动大，多跑几轮；≥ 500ms → 已经稳定，少跑
+                measure_rounds = 5 if probe_elapsed < 0.5 else 3
+                timings = [probe_elapsed]   # probe 那次也算一轮有效数据
+
                 self._sig_log.emit(
-                    f"  耗时 {elapsed*1000:.1f} ms  →  {ops:.1f} 万组合/秒")
+                    f"  [{lbl}] probe {probe_elapsed*1000:.1f}ms → 再跑 {measure_rounds - 1} 轮")
+
+                for r in range(measure_rounds - 1):
+                    t0 = _time.perf_counter()
+                    fn(modules, set(), set(), {}, 60, 8, k)
+                    timings.append(_time.perf_counter() - t0)
+
+                # 取中位数（抗离群值）
+                median_elapsed = _stat.median(timings)
+                ops = (total_combos / median_elapsed) / 10000.0
+
+                self._sig_speed.emit(mid, ops)
+                timing_strs = [f"{t*1000:.1f}" for t in timings]
+                self._sig_log.emit(
+                    f"  [{lbl}] 各轮: [{', '.join(timing_strs)}] ms"
+                    f"  中位数 {median_elapsed*1000:.1f} ms"
+                    f"  →  {ops:.1f} 万组合/秒")
+
             except Exception as e:
                 self._sig_log.emit(f"  [ERR] {lbl} 运行失败: {e}")
                 self._results[mid] = 0.0
+
+            done_count += 1
+            self._sig_prog.emit(int(done_count / avail_count * 90))
 
         self._sig_prog.emit(100)
         self._sig_log.emit("✓ 完成")
@@ -994,7 +1068,12 @@ class ConfigPanel(QWidget):
 
     def _export_config(self):
         cfg = self.get_config()
-        code = base64.b64encode(json.dumps(cfg, ensure_ascii=False).encode()).decode()
+        # 压缩导出：JSON → UTF-8 → zstd → base64，比纯 base64(json) 短 40~60%
+        import zstandard as _zstd
+        json_bytes = json.dumps(cfg, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+        compressed = _zstd.ZstdCompressor(level=19).compress(json_bytes)
+        # 前缀 "Z1:" 标识 zstd 压缩格式，导入端据此区分新旧格式
+        code = "Z1:" + base64.b64encode(compressed).decode('ascii')
         dlg = QDialog(self); dlg.setWindowTitle("导出配置码"); dlg.resize(500, 180)
         dlg.setStyleSheet(f"background:{BG2};color:{TEXT};")
         vl = QVBoxLayout(dlg); vl.setSpacing(10); vl.setContentsMargins(16,16,16,16)
@@ -1031,7 +1110,15 @@ class ConfigPanel(QWidget):
         def _do_import():
             code = te.toPlainText().strip()
             try:
-                cfg = json.loads(base64.b64decode(code.encode()).decode())
+                if code.startswith("Z1:"):
+                    # 新格式：Z1: 前缀 + base64(zstd(json))
+                    import zstandard as _zstd
+                    compressed = base64.b64decode(code[3:].encode('ascii'))
+                    json_bytes = _zstd.ZstdDecompressor().decompress(compressed)
+                    cfg = json.loads(json_bytes.decode('utf-8'))
+                else:
+                    # 兼容旧格式：纯 base64(json)
+                    cfg = json.loads(base64.b64decode(code.encode()).decode())
                 self.set_config(cfg)
                 dlg.accept()
             except Exception as e:
@@ -1340,7 +1427,7 @@ class OutputPanel(QWidget):
         self.lbl_cnt.setText(f"共 {len(results)} 套方案  (C(N, {combo_size}))")
 
 # ═══════════════════════════════════════════════════════════
-#  底部状态栏
+#  底部状态栏（实时进度条）
 # ═══════════════════════════════════════════════════════════
 class BottomBar(QWidget):
     start_clicked = Signal()
@@ -1350,7 +1437,15 @@ class BottomBar(QWidget):
         super().__init__(parent)
         self.setFixedHeight(64)
         self.setStyleSheet(f"background:{BG2};border-top:1px solid {BORDER};")
+        self._running = False
+        self._start_time: float = 0.0       # 运行起始时间戳
+        self._last_pct: int = 0              # 子进程回报的百分比
+        self._estimated_secs: float = 0.0    # 预估总耗时（秒），用于平滑进度条
         self._build()
+        from PySide6.QtCore import QTimer
+        self._timer = QTimer(self)
+        self._timer.setInterval(500)         # 0.5 秒刷新，进度条更丝滑
+        self._timer.timeout.connect(self._tick)
 
     def _build(self):
         lay=QHBoxLayout(self); lay.setContentsMargins(16,8,16,8); lay.setSpacing(12)
@@ -1365,12 +1460,16 @@ class BottomBar(QWidget):
 
         lay.addStretch()
 
+        prog_col = QVBoxLayout(); prog_col.setSpacing(2); prog_col.setContentsMargins(0,0,0,0)
         self.prog=QProgressBar(); self.prog.setRange(0,100); self.prog.setValue(0)
-        self.prog.setFixedWidth(200); lay.addWidget(self.prog)
+        self.prog.setFixedWidth(260); self.prog.setFixedHeight(10)
+        prog_col.addWidget(self.prog)
 
-        self.lbl_prog=QLabel("就绪")
-        self.lbl_prog.setStyleSheet(f"color:{TEXT2};font-size:12px;min-width:80px;")
-        lay.addWidget(self.lbl_prog)
+        self.lbl_realtime=QLabel("就绪")
+        self.lbl_realtime.setStyleSheet(
+            f"color:{TEXT2};font-size:11px;font-family:Consolas,'Courier New',monospace;min-width:260px;")
+        prog_col.addWidget(self.lbl_realtime)
+        lay.addLayout(prog_col)
 
         lay.addSpacing(16)
         self.btn_start=QPushButton("▶  开始"); self.btn_start.setObjectName("btn_start"); self.btn_start.setFixedHeight(40)
@@ -1380,12 +1479,83 @@ class BottomBar(QWidget):
         self.btn_stop.clicked.connect(self.stop_clicked)
         lay.addWidget(self.btn_start); lay.addWidget(self.btn_stop)
 
+    @staticmethod
+    def _fmt_duration(s: float) -> str:
+        if s < 1:      return "< 1s"
+        if s < 60:     return f"{s:.0f}s"
+        if s < 3600:   return f"{s/60:.1f}m"
+        return f"{s/3600:.1f}h"
+
+    def _tick(self):
+        """每 0.5 秒刷新进度条和状态文本。
+
+        进度来源（取最大值）：
+          ① 时间推算：elapsed / estimated_secs × 95%（上限 95%，留 5% 给收尾）
+          ② 子进程回报：_last_pct（解析到搭配结果时会跳到较高值）
+        两者取 max，保证进度条只进不退。
+        """
+        if not self._running or self._start_time <= 0:
+            return
+        elapsed = time.time() - self._start_time
+
+        # ── 计算合成进度 ──
+        time_pct = 0
+        if self._estimated_secs > 0:
+            # 上限 95%，剩余 5% 留给"解析结果→完成"阶段
+            time_pct = min(95, int(elapsed / self._estimated_secs * 95))
+        pct = max(self._last_pct, time_pct, 1)
+
+        if pct >= 100:
+            self.prog.setValue(100)
+            self.lbl_realtime.setText(f"✓ 完成  耗时 {self._fmt_duration(elapsed)}")
+            self._timer.stop()
+            return
+
+        self.prog.setValue(pct)
+
+        # ── 文本状态 ──
+        parts = [f"{pct}%", f"耗时 {self._fmt_duration(elapsed)}"]
+        if self._estimated_secs > 0:
+            remaining = max(0, self._estimated_secs - elapsed)
+            parts.append(f"剩余 ~{self._fmt_duration(remaining)}")
+        elif pct >= 5:
+            # 无预估时间时，从已有百分比线性外推
+            eta = elapsed / pct * (100 - pct)
+            parts.append(f"剩余 ~{self._fmt_duration(eta)}")
+        self.lbl_realtime.setText("  |  ".join(parts))
+
+    def set_estimated_secs(self, secs: float):
+        """设置本次运行的预估总耗时（秒），用于时间推算进度条。
+        由 MainWindow._start 根据基准测试数据计算后调用。
+        传 0 表示无预估（回退到纯子进程回报模式）。
+        """
+        self._estimated_secs = max(0.0, secs)
+
     def set_running(self, running):
+        self._running = running
         self.btn_start.setEnabled(not running); self.btn_stop.setEnabled(running)
+        if running:
+            self._start_time = time.time()
+            self._last_pct = 0
+            self.prog.setValue(0)
+            self.lbl_realtime.setText("启动中…")
+            self._timer.start()
+        else:
+            self._timer.stop()
+            if self._start_time > 0:
+                elapsed = time.time() - self._start_time
+                self.prog.setValue(100)
+                self.lbl_realtime.setText(f"✓ 完成  耗时 {self._fmt_duration(elapsed)}")
 
     def update_progress(self, v, lbl=""):
-        self.prog.setValue(v)
-        if lbl: self.lbl_prog.setText(lbl)
+        """子进程回报的进度（解析到搭配结果时触发）。"""
+        self._last_pct = v
+        # 立即同步进度条（取 max 防回退）
+        cur = self.prog.value()
+        if v > cur:
+            self.prog.setValue(v)
+        if lbl and not self._running:
+            self.lbl_realtime.setText(lbl)
 
     def update_estimate(self, n, k, mode, bench):
         if not n or n < k:
@@ -1542,6 +1712,20 @@ class MainWindow(QMainWindow):
 
     def _start(self):
         cfg=self.cfg.get_config(); cfg["mode"]=self._mode
+        # ── 根据基准测试数据计算预估耗时，传给进度条 ──
+        est_secs = 0.0
+        k = cfg.get("combo_size", 4)
+        n = self._last_module_n
+        speed = self._bench.get(self._mode, 0)
+        if n and n >= k and speed > 0:
+            try:
+                total = math.comb(n, k)
+                est_secs = (total / 1e4) / speed
+                # 加 20% 余量（预筛选、结果排序、IO 等开销）
+                est_secs *= 1.2
+            except Exception:
+                pass
+        self.bar.set_estimated_secs(est_secs)
         self.bar.set_running(True); self.bar.update_progress(0,"启动中…")
         self.out.log_edit.clear()
         self._worker=MonitorWorker(cfg)
@@ -1556,6 +1740,17 @@ class MainWindow(QMainWindow):
     def _on_module_count(self, n):
         self._last_module_n = n
         self._upd_est()
+        # ── 子进程刚报告了实际模组数 N，重新计算预估耗时推进进度条 ──
+        cfg = self.cfg.get_config()
+        k = cfg.get("combo_size", 4)
+        speed = self._bench.get(self._mode, 0)
+        if n >= k and speed > 0:
+            try:
+                total = math.comb(n, k)
+                est_secs = (total / 1e4) / speed * 1.2
+                self.bar.set_estimated_secs(est_secs)
+            except Exception:
+                pass
 
     def _stop(self):
         if self._worker and self._worker.isRunning():

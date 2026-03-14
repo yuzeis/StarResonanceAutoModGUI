@@ -360,7 +360,7 @@ class ModuleOptimizer:
         result = unique_solutions[:top_n]
         
         # 如果使用了目标属性，在最终返回前恢复原始评分
-        if self.target_attributes:
+        if self.target_attributes or self.min_attr_sum_requirements:
             result = self._restore_original_scores(result)
         
         self.logger.info(self._t(f"优化完成，返回{len(result)}个最优解", f"Optimization finished, returning {len(result)} best solutions"))
@@ -593,8 +593,9 @@ class ModuleOptimizer:
                     else:
                         threshold_power += BASIC_ATTR_POWER_MAP.get(max_level, 0)
             
-            # 计算总属性战斗力
-            total_attr_power = TOTAL_ATTR_POWER_MAP.get(total_attr_value, 0)
+            # 计算总属性战斗力 — 与 C++ 一致: capped = min(total, 120)
+            capped_total = min(total_attr_value, 120)
+            total_attr_power = TOTAL_ATTR_POWER_MAP.get(capped_total, 0)
             original_score = threshold_power + total_attr_power
             
             restored_solutions.append(ModuleSolution(

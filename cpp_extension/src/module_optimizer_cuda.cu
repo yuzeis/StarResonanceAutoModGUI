@@ -32,6 +32,10 @@ __constant__ int D_TOTAL_ATTR_POWER_VALUES[121] = {
     471, 477, 483, 489, 495, 500, 506, 512, 518, 524, 530, 535, 541, 547, 553, 559, 565, 570, 576, 582,
     588, 594, 599, 605, 611, 617, 623, 629, 634, 640, 646, 652, 658, 664, 669, 675, 681, 687, 693, 699};
 
+// 属性聚合槽数量上限。游戏目前 21 种属性，10件×4词条最多40次聚合。
+// 32 个槽留有余量；若属性种类增加需同步调整此常量。
+#define MAX_AGG_SLOTS 32
+
 __global__ void TestKernel(int *data, int size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) data[idx] = idx * 2;
@@ -47,15 +51,30 @@ __device__ long long GpuCombinationCount(int n, int r) {
 }
 
 // 通用组合解包（支持任意 r 件，最大10件）
+// 优化：内层用二分搜索代替线性扫描（O(r*log(n)) vs O(r*n)）
 __device__ void GpuGetCombinationByIndex(int n, int r, long long index, int *combination) {
     long long remaining = index;
     for (int i = 0; i < r; ++i) {
         int start = (i == 0) ? 0 : combination[i - 1] + 1;
-        for (int j = start; j < n; ++j) {
-            long long ca = GpuCombinationCount(n - j - 1, r - i - 1);
-            if (remaining < ca) { combination[i] = j; break; }
-            remaining -= ca;
+        int end   = n - r + i;   // combination[i] 的最大合法值
+        // 二分搜索：找到最小的 j 使得 sum_{x=start..j} C(n-x-1, r-i-1) > remaining
+        int lo = start, hi = end;
+        while (lo < hi) {
+            int mid = (lo + hi) / 2;
+            // 计算从 start 到 mid 的累积组合数
+            // prefix_sum(start..mid) = C(n-start, r-i) - C(n-mid-1, r-i)
+            long long prefix = GpuCombinationCount(n - start, r - i)
+                             - GpuCombinationCount(n - mid - 1, r - i);
+            if (prefix <= remaining)
+                lo = mid + 1;
+            else
+                hi = mid;
         }
+        // lo 即为 combination[i]
+        long long consumed = GpuCombinationCount(n - start, r - i)
+                           - GpuCombinationCount(n - lo, r - i);
+        remaining -= consumed;
+        combination[i] = lo;
     }
 }
 
@@ -115,11 +134,10 @@ __global__ void GpuEnumerationKernel(
     for (long long combo_idx = seg_start; combo_idx < seg_end; ++combo_idx) {
         long long output_idx = combo_idx - start_combination;
 
-        // 属性聚合 - 使用32个槽（游戏中最多21种属性，留余量）
-        // Bug修复1: CUDA设备端不保证 = {} 聚合初始化可靠，改用显式清零循环
-        int aggregated_ids[32];
-        int aggregated_values[32];
-        for (int _i = 0; _i < 32; ++_i) { aggregated_ids[_i] = 0; aggregated_values[_i] = 0; }
+        // 属性聚合 - 使用 MAX_AGG_SLOTS 个槽（游戏中最多21种属性，留余量）
+        int aggregated_ids[MAX_AGG_SLOTS];
+        int aggregated_values[MAX_AGG_SLOTS];
+        for (int _i = 0; _i < MAX_AGG_SLOTS; ++_i) { aggregated_ids[_i] = 0; aggregated_values[_i] = 0; }
         int agg_count = 0;
         int total_attr_value = 0;
 
@@ -132,11 +150,11 @@ __global__ void GpuEnumerationKernel(
                 int attr_value = attr_values[start_off + i];
                 total_attr_value += attr_value;
                 int found_idx = -1;
-                for (int j = 0; j < agg_count && j < 32; ++j) {
+                for (int j = 0; j < agg_count && j < MAX_AGG_SLOTS; ++j) {
                     if (aggregated_ids[j] == attr_id) { found_idx = j; break; }
                 }
                 if (found_idx >= 0) aggregated_values[found_idx] += attr_value;
-                else if (agg_count < 32) {
+                else if (agg_count < MAX_AGG_SLOTS) {
                     aggregated_ids[agg_count]   = attr_id;
                     aggregated_values[agg_count] = attr_value;
                     ++agg_count;
@@ -236,13 +254,18 @@ __global__ void HistogramByteKernel(
 
 static int Radix256SelectThreshold(const int *d_scores, long long n, int k, int grid_size, int block_size) {
     unsigned int *d_hist = nullptr;
-    cudaMalloc(&d_hist, 256 * sizeof(unsigned int));
+    if (cudaMalloc(&d_hist, 256 * sizeof(unsigned int)) != cudaSuccess) return 0;
     unsigned int prefix_mask = 0U, prefix_value = 0U;
     for (int byte_idx = 3; byte_idx >= 0; --byte_idx) {
         cudaMemset(d_hist, 0, 256 * sizeof(unsigned int));
         HistogramByteKernel<<<grid_size, block_size>>>(d_scores, n, prefix_mask, prefix_value, byte_idx, d_hist);
+        if (cudaGetLastError() != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) {
+            cudaFree(d_hist); return 0;
+        }
         unsigned int h_hist[256];
-        cudaMemcpy(h_hist, d_hist, 256 * sizeof(unsigned int), cudaMemcpyDeviceToHost);
+        if (cudaMemcpy(h_hist, d_hist, 256 * sizeof(unsigned int), cudaMemcpyDeviceToHost) != cudaSuccess) {
+            cudaFree(d_hist); return 0;
+        }
         unsigned int acc = 0U; int chosen_bucket = 0;
         for (int b = 255; b >= 0; --b) {
             acc += h_hist[b];
@@ -559,38 +582,47 @@ extern "C" int GpuStrategyEnumeration(
         }
         // 返回实际结果数（与 OpenCL 一致，非固定 max_solutions）
         int final_count = out_n;
-        // cleanup 后返回
-        if (d_attr_ids)       cudaFree(d_attr_ids);
-        if (d_attr_values)    cudaFree(d_attr_values);
-        if (d_attr_counts)    cudaFree(d_attr_counts);
-        if (d_offsets)        cudaFree(d_offsets);
-        if (d_target_attrs)   cudaFree(d_target_attrs);
-        if (d_exclude_attrs)  cudaFree(d_exclude_attrs);
-        if (d_min_attr_ids)   cudaFree(d_min_attr_ids);
-        if (d_min_attr_values)cudaFree(d_min_attr_values);
-        if (d_scores)         cudaFree(d_scores);
-        if (d_indices)        cudaFree(d_indices);
-        if (d_flags)          cudaFree(d_flags);
-        if (d_out_count)      cudaFree(d_out_count);
-        if (d_comp_scores)    cudaFree(d_comp_scores);
-        if (d_comp_indices)   cudaFree(d_comp_indices);
+
+        // 统一清理所有 GPU 缓冲区（消除重复代码）
+        auto free_all = [&]() {
+            if (d_attr_ids)       cudaFree(d_attr_ids);
+            if (d_attr_values)    cudaFree(d_attr_values);
+            if (d_attr_counts)    cudaFree(d_attr_counts);
+            if (d_offsets)        cudaFree(d_offsets);
+            if (d_target_attrs)   cudaFree(d_target_attrs);
+            if (d_exclude_attrs)  cudaFree(d_exclude_attrs);
+            if (d_min_attr_ids)   cudaFree(d_min_attr_ids);
+            if (d_min_attr_values)cudaFree(d_min_attr_values);
+            if (d_scores)         cudaFree(d_scores);
+            if (d_indices)        cudaFree(d_indices);
+            if (d_flags)          cudaFree(d_flags);
+            if (d_out_count)      cudaFree(d_out_count);
+            if (d_comp_scores)    cudaFree(d_comp_scores);
+            if (d_comp_indices)   cudaFree(d_comp_indices);
+        };
+        free_all();
         return final_count;
     }
 
 cleanup:
-    if (d_attr_ids)       cudaFree(d_attr_ids);
-    if (d_attr_values)    cudaFree(d_attr_values);
-    if (d_attr_counts)    cudaFree(d_attr_counts);
-    if (d_offsets)        cudaFree(d_offsets);
-    if (d_target_attrs)   cudaFree(d_target_attrs);
-    if (d_exclude_attrs)  cudaFree(d_exclude_attrs);
-    if (d_min_attr_ids)   cudaFree(d_min_attr_ids);
-    if (d_min_attr_values)cudaFree(d_min_attr_values);
-    if (d_scores)         cudaFree(d_scores);
-    if (d_indices)        cudaFree(d_indices);
-    if (d_flags)          cudaFree(d_flags);
-    if (d_out_count)      cudaFree(d_out_count);
-    if (d_comp_scores)    cudaFree(d_comp_scores);
-    if (d_comp_indices)   cudaFree(d_comp_indices);
+    {
+        auto free_all = [&]() {
+            if (d_attr_ids)       cudaFree(d_attr_ids);
+            if (d_attr_values)    cudaFree(d_attr_values);
+            if (d_attr_counts)    cudaFree(d_attr_counts);
+            if (d_offsets)        cudaFree(d_offsets);
+            if (d_target_attrs)   cudaFree(d_target_attrs);
+            if (d_exclude_attrs)  cudaFree(d_exclude_attrs);
+            if (d_min_attr_ids)   cudaFree(d_min_attr_ids);
+            if (d_min_attr_values)cudaFree(d_min_attr_values);
+            if (d_scores)         cudaFree(d_scores);
+            if (d_indices)        cudaFree(d_indices);
+            if (d_flags)          cudaFree(d_flags);
+            if (d_out_count)      cudaFree(d_out_count);
+            if (d_comp_scores)    cudaFree(d_comp_scores);
+            if (d_comp_indices)   cudaFree(d_comp_indices);
+        };
+        free_all();
+    }
     return 0;
 }

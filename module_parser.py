@@ -59,6 +59,12 @@ class ModuleParser:
                     # 查找模组详细信息
                     mod_info = mod_infos.get(key) if mod_infos else None
 
+                    if mod_info is None:
+                        self.logger.debug(self._t(
+                            f"模组 '{module_name}' (key={key}) 无详细信息, 跳过",
+                            f"Module '{module_name}' (key={key}) has no detail info, skipped"))
+                        continue
+
                     module_info = ModuleInfo(
                         name=module_name,
                         config_id=config_id,
@@ -87,8 +93,8 @@ class ModuleParser:
                         part_disp = part.name if self.lang != 'en' else to_english_attr(part.name)
                         self.logger.debug(self._t(f"  - {part.name}: {part.value}", f"  - {part_disp}: {part.value}"))
                 else:
-                    # 不是模组背包
-                    break
+                    # 不是模组, 跳过此 item 继续检查后续
+                    continue
         if modules:
             self.logger.debug(self._t(f"解析到 {len(modules)} 个模组信息", f"Parsed {len(modules)} modules"))
             self.logger.debug(self._t("模组信息摘要:", "Modules summary:"))
@@ -154,6 +160,17 @@ class ModuleParser:
             else:
                 self.logger.debug(self._t(f"模组 '{module.name}' 通过筛选: 无属性筛选条件", f"Module '{to_english_module(module.config_id, module.name)}' passed: no attribute conditions"))
             
+            # 检查排除属性 —— 如果模组包含任何排除属性，则跳过
+            if exclude_attributes:
+                excluded_attrs = [attr for attr in module_attrs if attr in exclude_attributes]
+                if excluded_attrs:
+                    if self.lang == 'en':
+                        ex_disp = [to_english_attr(a) for a in excluded_attrs]
+                        self.logger.debug(f"Module '{to_english_module(module.config_id, module.name)}' excluded: contains excluded attrs ({', '.join(ex_disp)})")
+                    else:
+                        self.logger.debug(f"模组 '{module.name}' 被排除: 包含排除属性 ({', '.join(excluded_attrs)})")
+                    continue
+            
             filtered_modules.append(module)
         
         return filtered_modules
@@ -186,10 +203,13 @@ class ModuleParser:
             
             # 模组筛选完成后自动退出程序
             self.logger.info(self._t("=== 模组筛选完成，准备退出程序 ===", "=== Module filtering finished, exiting ==="))
-            import os
-            os._exit(0)
+            import sys
+            sys.exit(0)
             
+        except SystemExit:
+            raise  # 允许 sys.exit 正常传播
         except ImportError as e:
             self.logger.warning(self._t(f"无法导入模组优化器: {e}", f"Cannot import module optimizer: {e}"))
         except Exception as e:
             self.logger.error(self._t(f"模组搭配优化失败: {e}", f"Module optimization failed: {e}"))
+            raise  # 让上层感知到失败, 而不是静默吞掉

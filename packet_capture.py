@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass
 from typing import Optional, Callable, Dict, Any
 
-from scapy.all import sniff, IP, TCP, Raw  # type: ignore
+from scapy_minimal import sniff, IP, TCP, Raw  # type: ignore  # 使用最小化包装器，减小打包体积
 import zstandard as zstd
 from BlueProtobuf_pb2 import SyncContainerData
 from notify_dumper import NotifyDumper

@@ -162,6 +162,8 @@ class StarResonanceMonitor:
                     compute_mode=self.compute_mode
                 )
                     
+        except SystemExit:
+            raise  # 允许 sys.exit 正常传播（模组优化完成后的正常退出）
         except Exception as e:
             logger.error(_tr(self.lang, f"处理SyncContainerData数据包失败: {e}", f"Failed to process SyncContainerData packet: {e}"))
             

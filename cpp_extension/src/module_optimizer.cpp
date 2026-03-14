@@ -49,11 +49,23 @@ void GetCombinationByIndex(size_t n, size_t r, size_t index, std::vector<size_t>
     size_t remaining = index;
     for (size_t i = 0; i < r; ++i) {
         size_t start = (i == 0) ? 0 : combination[i-1] + 1;
-        for (size_t j = start; j < n; ++j) {
-            size_t ca = CombinationCount(n - j - 1, r - i - 1);
-            if (remaining < ca) { combination[i] = j; break; }
-            remaining -= ca;
+        size_t end   = n - r + i;  // 最大合法值
+        // 二分搜索：找到最小的 j 使得 prefix_sum(start..j) > remaining
+        size_t lo = start, hi = end;
+        while (lo < hi) {
+            size_t mid = lo + (hi - lo) / 2;
+            // prefix_sum(start..mid) = C(n-start, r-i) - C(n-mid-1, r-i)
+            size_t prefix = CombinationCount(n - start, r - i)
+                          - CombinationCount(n - mid - 1, r - i);
+            if (prefix <= remaining)
+                lo = mid + 1;
+            else
+                hi = mid;
         }
+        size_t consumed = CombinationCount(n - start, r - i)
+                        - CombinationCount(n - lo, r - i);
+        remaining -= consumed;
+        combination[i] = lo;
     }
 }
 
@@ -71,7 +83,9 @@ std::vector<CompactSolution> ModuleOptimizerCpp::ProcessCombinationRange(
     size_t range_size = end_combination - start_combination;
 
     std::vector<CompactSolution> solution;
-    int ext_space = local_top_capacity;
+    // ext_space 控制 nth_element 裁剪前允许的超额条目数
+    // 过大会导致内存峰值翻倍；使用 min(cap/2, 2048) 平衡裁剪频率和内存
+    int ext_space = std::min(std::max(local_top_capacity / 2, 64), 2048);
     solution.reserve(std::min(range_size, static_cast<size_t>(local_top_capacity + ext_space)));
     int current_min = std::numeric_limits<int>::min();
 
@@ -269,8 +283,11 @@ std::vector<ModuleSolution> ModuleOptimizerCpp::StrategyEnumeration(
     size_t n = candidate_modules.size();
     size_t total_combinations = CombinationCount(n, r);
 
+    // CPU 批次上限：限制单个任务的组合数以保证线程池负载均衡
+    // 经验值：约 130 万组合/批次在现代 CPU 上约 50~200ms，避免长尾任务
+    static constexpr size_t MAX_BATCH_SIZE = 1'300'000;
     size_t batch_size = std::max(static_cast<size_t>(1000), total_combinations / (max_workers * 4));
-    batch_size = std::min(batch_size, static_cast<size_t>(1307072));
+    batch_size = std::min(batch_size, MAX_BATCH_SIZE);
     size_t num_batches = (total_combinations + batch_size - 1) / batch_size;
 
     auto pool = std::make_unique<SimpleThreadPool>(max_workers);

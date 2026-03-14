@@ -87,13 +87,15 @@ def find_default_network_interface(interfaces: List[Dict]) -> Optional[int]:
                     line = line.strip()
                     if line.startswith('0.0.0.0'):
                         parts = line.split()
-                        if len(parts) >= 4:
-                            default_gateway = parts[3]
+                        # route print 格式: Network  Netmask  Gateway  Interface  Metric
+                        # parts[0]=Network parts[1]=Netmask parts[2]=Gateway parts[3]=Interface
+                        if len(parts) >= 5:
+                            interface_addr = parts[3]
                             
-                            # 查找包含默认网关的接口
+                            # 查找拥有该 IP 地址的接口
                             for i, interface in enumerate(interfaces):
                                 for addr_info in interface['addresses']:
-                                    if addr_info['addr'] == default_gateway:
+                                    if addr_info['addr'] == interface_addr:
                                         return i
                                         
     except Exception as e:

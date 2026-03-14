@@ -322,7 +322,7 @@ __kernel void score_range(
         }
 
         if (!pass_min_filter) {
-            out_scores[gid_local] = 0;
+            out_scores[gid_local] = -1;
             for (int s = 0; s < slots_per_sol; ++s)
                 out_indices[gid_local * slots_per_sol + s] = 0UL;
             if (!next_combination((uint)module_count, (uint)combo_size, comb)) break;

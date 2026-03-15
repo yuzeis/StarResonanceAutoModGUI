@@ -45,7 +45,8 @@ class StarResonanceMonitor:
     def __init__(self, interface_index: int = None, category: str = "全部", attributes: List[str] = None, 
                  exclude_attributes: List[str] = None, match_count: int = 1, enumeration_mode: bool = False,
                  min_attr_sum: dict | None = None, lang: str = 'zh',
-                 combo_size: int = 4, compute_mode: str = 'cpu'):
+                 combo_size: int = 4, compute_mode: str = 'cpu',
+                 generate_vdata: bool = False):
         """
         初始化监控器
         
@@ -57,6 +58,7 @@ class StarResonanceMonitor:
             match_count: 模组需要包含的指定词条数量
             enumeration_mode: 是否启用枚举模式
             min_attr_sum: 强制某属性在4件套总和≥VALUE的字典
+            generate_vdata: 在线模式下是否将抓到的数据包保存为 modules.vdata
         """
         self.interface_index = interface_index
         self.category = category
@@ -68,6 +70,8 @@ class StarResonanceMonitor:
         self.lang = (lang or 'zh').lower()
         self.combo_size = max(1, min(10, int(combo_size)))
         self.compute_mode = (compute_mode or 'cpu').lower()
+        # generate_vdata 仅在在线模式（非 --load-vdata）下有意义
+        self.generate_vdata = bool(generate_vdata)
         self.is_running = False
         
         # 获取网络接口信息
@@ -133,39 +137,81 @@ class StarResonanceMonitor:
         logger.info(_tr(self.lang, "=== 监控已停止 ===", "=== Monitoring Stopped ==="))
         
     def _on_sync_container_data(self, data: Dict[str, Any]):
-        """处理SyncContainerData数据包"""
+        """处理SyncContainerData数据包
+
+        注意: 此方法运行在 PacketCapture 的守护线程中，不能调用 sys.exit()。
+        优化完成后通过设置 self.is_running = False 通知主线程退出。
+
+        修复: 无论成功还是异常，finally 块都将 is_running 置 False，
+        防止服务进程永久阻塞在 while monitor.is_running 循环中。
+        """
         self.stats['sync_container_packets'] += 1
-        
+
+        # 防重入：若已完成或已停止，忽略后续重复回调
+        if not self.is_running:
+            return
+
         try:
-            # 解析模组信息
             v_data = data.get('v_data')
-            if v_data:
-                # 捕获后立即保存为最新离线数据
+            if not v_data:
+                # VData 为空（非模组包），继续等待下一个包，不退出
+                logger.debug(_tr(self.lang,
+                    "收到非模组数据包，继续等待...",
+                    "Received non-module packet, waiting..."))
+                return
+
+            # ── 可选：保存 vdata 文件 ─────────────────────────────
+            if self.generate_vdata:
                 try:
                     base_dir = get_exec_base_dir()
                     vdata_path = os.path.join(base_dir, 'modules.vdata')
                     with open(vdata_path, 'wb') as f:
                         f.write(v_data.SerializeToString())
-                    logger.info(_tr(self.lang, f"已保存模组数据到: {vdata_path}", f"Saved module data to: {vdata_path}"))
+                    logger.info(_tr(self.lang,
+                        f"已保存模组数据到: {vdata_path}",
+                        f"Saved module data to: {vdata_path}"))
                 except Exception as e:
-                    logger.warning(_tr(self.lang, f"保存模组数据失败: {e}", f"Failed to save module data: {e}"))
+                    logger.warning(_tr(self.lang,
+                        f"保存模组数据失败（不影响优化）: {e}",
+                        f"Failed to save module data (optimization continues): {e}"))
+            else:
+                logger.debug(_tr(self.lang,
+                    "「生成 vdata」未启用，跳过保存",
+                    "generate_vdata disabled, skipping save"))
 
-                self.module_parser.parse_module_info(
-                    v_data=v_data, 
-                    category=self.category, 
-                    attributes=self.attributes, 
-                    exclude_attributes=self.exclude_attributes,
-                    match_count=self.match_count,
-                    enumeration_mode=self.enumeration_mode,
-                    min_attr_sum=self.min_attr_sum,
-                    combo_size=self.combo_size,
-                    compute_mode=self.compute_mode
-                )
-                    
-        except SystemExit:
-            raise  # 允许 sys.exit 正常传播（模组优化完成后的正常退出）
+            # ── 核心：解析 + 优化 ─────────────────────────────────
+            self.module_parser.parse_module_info(
+                v_data=v_data,
+                category=self.category,
+                attributes=self.attributes,
+                exclude_attributes=self.exclude_attributes,
+                match_count=self.match_count,
+                enumeration_mode=self.enumeration_mode,
+                min_attr_sum=self.min_attr_sum,
+                combo_size=self.combo_size,
+                compute_mode=self.compute_mode
+            )
+
+            # parse_module_info 正常返回 → 优化完成，刷新 stdout
+            import sys as _sys
+            _sys.stdout.flush()
+            logger.info(_tr(self.lang,
+                "=== 优化完成，通知主线程退出 ===",
+                "=== Optimization done, signaling main thread to exit ==="))
+
         except Exception as e:
-            logger.error(_tr(self.lang, f"处理SyncContainerData数据包失败: {e}", f"Failed to process SyncContainerData packet: {e}"))
+            # 修复: 原来只 log 不退出，导致 is_running 永远为 True，进程挂死
+            logger.error(_tr(self.lang,
+                f"处理SyncContainerData数据包失败: {e}",
+                f"Failed to process SyncContainerData packet: {e}"),
+                exc_info=True)
+        finally:
+            # 无论成功/失败/异常，保证 is_running 被置 False，主线程可以退出
+            self.is_running = False
+            try:
+                self.packet_capture.stop_capture()
+            except Exception:
+                pass
             
 
             
@@ -197,6 +243,8 @@ def main():
     parser.add_argument('--lang', '-lang', type=str, default='zh', help='输出语言: zh 或 en (默认: zh)')
     parser.add_argument('--load-vdata', '-lv', action='store_true',
                        help='从可执行文件目录读取 modules.vdata, 跳过抓包直接运算')
+    parser.add_argument('--generate-vdata', '-gv', action='store_true',
+                       help='在线模式下将抓到的 v_data 保存为 modules.vdata（离线模式下自动忽略）')
 
     args = parser.parse_args()
     # 语言归一
@@ -249,8 +297,6 @@ def main():
                 combo_size=args.combo_size,
                 compute_mode=args.compute_mode
             )
-        except SystemExit:
-            raise
         except Exception as e:
             logger.error(_tr(lang, f"离线计算失败: {e}", f"Offline computation failed: {e}"))
             sys.exit(1)
@@ -282,34 +328,62 @@ def main():
         
     # 确定要使用的接口
     interface_index = None
-    
+
     if args.auto:
-        # 自动检测默认接口
-        print(_tr(lang, "自动检测默认网络接口...", "Auto-detecting default network interface..."))
-        interface_index = select_network_interface(interfaces, auto_detect=True)
+        # 自动检测默认接口（GUI 模式下 stdin 不可用，必须捕获所有异常）
+        try:
+            from network_interface_util import find_default_network_interface
+            interface_index = find_default_network_interface(interfaces)
+        except Exception as e:
+            logger.debug(f"auto-detect via find_default_network_interface failed: {e}")
+            interface_index = None
+
         if interface_index is None:
-            logger.error(_tr(lang, "未找到默认网络接口!", "Default network interface not found!"))
-            return
+            # fallback: 取第一个活动接口，避免 select_network_interface 进入 input() 交互
+            for i, iface in enumerate(interfaces):
+                if iface.get('is_up', False):
+                    interface_index = i
+                    logger.info(_tr(lang,
+                        f"自动检测未找到默认路由，使用第一个活动接口: {i} - {iface.get('description', iface['name'])}",
+                        f"Auto-detect fallback to first active interface: {i} - {iface.get('description', iface['name'])}"))
+                    break
+
+        if interface_index is None:
+            logger.error(_tr(lang, "未找到可用的网络接口!", "No available network interface found!"))
+            sys.exit(1)
+        else:
+            iface_desc = interfaces[interface_index].get('description', interfaces[interface_index]['name'])
+            print(_tr(lang,
+                f"使用网络接口: {interface_index} - {iface_desc}",
+                f"Using network interface: {interface_index} - {iface_desc}"))
+
     elif args.interface is not None:
         # 使用指定的接口索引
         if 0 <= args.interface < len(interfaces):
             interface_index = args.interface
         else:
-            logger.error(f"无效的接口索引: {args.interface}")
-            return
+            logger.error(_tr(lang,
+                f"无效的接口索引: {args.interface}（共 {len(interfaces)} 个接口）",
+                f"Invalid interface index: {args.interface} (total {len(interfaces)} interfaces)"))
+            sys.exit(1)
     else:
-        # 交互式选择
+        # 交互式选择（仅用于命令行直接运行，GUI 永远不走这里）
         print(_tr(lang, "星痕共鸣模组筛选器!", "Star Resonance Module Filter!"))
         print(_tr(lang, "版本: V1.6.5", "Version: V1.6.5"))
         print("GitHub: https://github.com/fudiyangjin/StarResonanceAutoMod")
         print()
-        
-        interface_index = select_network_interface(interfaces)
+        try:
+            interface_index = select_network_interface(interfaces)
+        except (EOFError, KeyboardInterrupt):
+            logger.error(_tr(lang, "未选择网络接口!", "No network interface selected!"))
+            sys.exit(1)
         if interface_index is None:
             logger.error(_tr(lang, "未选择网络接口!", "No network interface selected!"))
-            return
-            
+            sys.exit(1)
+
     # 创建监控器
+    # generate_vdata 仅在在线模式有意义；若用户误在 --load-vdata 时传入，强制忽略
+    effective_generate_vdata = getattr(args, 'generate_vdata', False) and not args.load_vdata
     monitor = StarResonanceMonitor(
         interface_index=interface_index,
         category=category_cn,
@@ -320,24 +394,41 @@ def main():
         min_attr_sum=min_attr_sum,
         lang=lang,
         combo_size=args.combo_size,
-        compute_mode=args.compute_mode
+        compute_mode=args.compute_mode,
+        generate_vdata=effective_generate_vdata
     )
     
     try:
         # 启动监控
         monitor.start_monitoring()
-        
+
         # 等待模组解析完成
-        logger.info(_tr(lang, "等待模组数据包... (解析完成后将自动退出)", "Waiting for module packets... (Will exit after parsing)"))
-        
-        while monitor.is_running:
-            time.sleep(0.1)  # 更频繁的检查，减少延迟
-            
+        logger.info(_tr(lang,
+            "等待模组数据包... (解析完成后将自动退出)",
+            "Waiting for module packets... (Will exit after parsing)"))
+
+        # 增加超时保护（60分钟），防止进程永久阻塞
+        _MAX_WAIT = 3600
+        _waited = 0
+        while monitor.is_running and _waited < _MAX_WAIT:
+            time.sleep(0.1)
+            _waited += 0.1
+
+        if _waited >= _MAX_WAIT:
+            logger.warning(_tr(lang,
+                "等待超时（60分钟），强制退出",
+                "Wait timeout (60min), force exit"))
+
     except KeyboardInterrupt:
-        logger.info("收到停止信号")
+        logger.info(_tr(lang, "收到停止信号", "Received stop signal"))
+    except Exception as e:
+        logger.error(_tr(lang, f"在线监控异常: {e}", f"Online monitoring error: {e}"), exc_info=True)
     finally:
         if monitor.is_running:
             monitor.stop_monitoring()
+        # 确保所有输出刷新到管道（GUI 从 stdout 读取结果）
+        sys.stdout.flush()
+        sys.stderr.flush()
 
 
 if __name__ == "__main__":

@@ -201,13 +201,11 @@ class ModuleParser:
             
             optimizer.optimize_and_display(modules, target_category, top_n=40, enumeration_mode=enumeration_mode)
             
-            # 模组筛选完成后自动退出程序
-            self.logger.info(self._t("=== 模组筛选完成，准备退出程序 ===", "=== Module filtering finished, exiting ==="))
-            import sys
-            sys.exit(0)
+            # 正常返回，由调用方决定如何退出（设 is_running=False 或 sys.exit）
+            # 不在此处调用 sys.exit() —— 在线模式下此函数运行在守护线程中，
+            # sys.exit() 只会抛 SystemExit 杀死当前线程，无法终止进程。
+            self.logger.info(self._t("=== 模组筛选完成 ===", "=== Module filtering finished ==="))
             
-        except SystemExit:
-            raise  # 允许 sys.exit 正常传播
         except ImportError as e:
             self.logger.warning(self._t(f"无法导入模组优化器: {e}", f"Cannot import module optimizer: {e}"))
         except Exception as e:

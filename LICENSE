@@ -1,15 +1,4 @@
-StarResonanceAutoModGUI
-
-本项目基于开源项目 StarResonanceAutoMod 修改而来。
-原项目作者：fudiyangjin
-原项目地址：https://github.com/fudiyangjin/StarResonanceAutoMod
-
-本项目及其修改内容遵循 GNU Affero General Public License v3.0（AGPL-3.0）发布。
-使用、修改和再分发本项目时，应保留原项目归属说明、许可证文本以及协议要求下应当公开的对应源代码。
-
-以下为 AGPL-3.0 协议原文：
-
-                    GNU AFFERO GENERAL PUBLIC LICENSE
+                   GNU AFFERO GENERAL PUBLIC LICENSE
                        Version 3, 19 November 2007
 
  Copyright (C) 2007 Free Software Foundation, Inc. <https://fsf.org/>

@@ -68,6 +68,69 @@ SPECIAL_ATTRS = [
 ALL_ATTRS  = BASIC_ATTRS + SPECIAL_ATTRS
 CATEGORIES = ["全部","攻击","守护","辅助"]
 
+# ── 配置码：属性名 ↔ 2字符缩写（用于语义压缩，降低配置码长度）─────────────────
+_ATTR_ABBR: dict[str, str] = {
+    "力量加持":     "a1", "敏捷加持":     "a2", "智力加持":     "a3",
+    "特攻伤害":     "a4", "精英打击":     "a5",
+    "特攻治疗加持": "a6", "专精治疗加持": "a7",
+    "施法专注":     "a8", "攻速专注":     "a9", "暴击专注":     "aa",
+    "幸运专注":     "ab", "抵御魔法":     "ac", "抵御物理":     "ad",
+    "极-绝境守护":  "b1", "极-伤害叠加":  "b2", "极-灵活身法":  "b3",
+    "极-生命凝聚":  "b4", "极-急救措施":  "b5", "极-生命波动":  "b6",
+    "极-生命汲取":  "b7", "极-全队幸暴":  "b8",
+}
+_ABBR_ATTR: dict[str, str] = {v: k for k, v in _ATTR_ABBR.items()}
+
+# 配置项默认值（导出时跳过与默认值相同的项，减小体积）
+_CFG_DEFAULTS: dict = {
+    "auto_interface": True, "interface_index": 0, "load_vdata": False,
+    "generate_vdata": False, "category": "全部", "attributes": [],
+    "exclude_attributes": [], "match_count": 1, "combo_size": 4,
+    "enumeration_mode": False, "debug": False, "min_attr_sum": {}, "remark": "",
+}
+
+def _encode_config(cfg: dict) -> str:
+    """配置 → 配置码（Z4: 前缀）
+    流程: 去默认值 → 属性名缩写 → JSON → zstd(19) → base85
+    """
+    import zstandard as _zstd
+    mini: dict = {}
+    for k, v in cfg.items():
+        if v == _CFG_DEFAULTS.get(k):
+            continue
+        if k in ("attributes", "exclude_attributes"):
+            v = [_ATTR_ABBR.get(a, a) for a in v]
+        elif k == "min_attr_sum":
+            v = {_ATTR_ABBR.get(a, a): n for a, n in v.items()}
+        mini[k] = v
+    json_bytes = json.dumps(mini, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+    compressed = _zstd.ZstdCompressor(level=19).compress(json_bytes)
+    return "Z4:" + base64.b85encode(compressed).decode('ascii')
+
+def _decode_config(code: str) -> dict:
+    """配置码 → 配置字典，兼容 Z4 / Z1 / 旧 base64 三种格式"""
+    import zstandard as _zstd
+    if code.startswith("Z4:"):
+        compressed = base64.b85decode(code[3:].encode('ascii'))
+        json_bytes = _zstd.ZstdDecompressor().decompress(compressed)
+        mini = json.loads(json_bytes.decode('utf-8'))
+        # 还原缩写 + 补全默认值
+        cfg = dict(_CFG_DEFAULTS)
+        for k, v in mini.items():
+            if k in ("attributes", "exclude_attributes"):
+                v = [_ABBR_ATTR.get(a, a) for a in v]
+            elif k == "min_attr_sum":
+                v = {_ABBR_ATTR.get(a, a): n for a, n in v.items()}
+            cfg[k] = v
+        return cfg
+    if code.startswith("Z1:"):
+        compressed = base64.b64decode(code[3:].encode('ascii'))
+        json_bytes = _zstd.ZstdDecompressor().decompress(compressed)
+        return json.loads(json_bytes.decode('utf-8'))
+    # 最旧格式：纯 base64(json)
+    return json.loads(base64.b64decode(code.encode()).decode())
+
+
 # ═══════════════════════════════════════════════════════════
 #  全局样式表
 # ═══════════════════════════════════════════════════════════
@@ -753,33 +816,48 @@ class MonitorWorker(QThread):
             self.log_signal.emit("[INFO] 枚举模式已启用")
         if cfg.get("load_vdata"):
             self.log_signal.emit("[INFO] 离线模式：从 modules.vdata 读取")
+        else:
+            self.log_signal.emit("[INFO] 在线模式：实时抓包获取模组数据")
+            if cfg.get("generate_vdata"):
+                self.log_signal.emit("[INFO] ✦ 已启用「生成 vdata」—— 抓包成功后将保存 modules.vdata")
 
         import subprocess, sys as _sys, os as _os, re as _re
         # 构建 CLI 参数
-        cli = [_sys.executable,
-               _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "star_railway_monitor.py")]
+        # ── 区分编译环境与开发环境 ──────────────────────────────────────────
+        # PyInstaller 打包后 sys.executable 指向 .exe 本身，不能再用它来"运行 .py"。
+        # 此时改为：exe --run-monitor <args>，入口点会拦截该标志并调用监控器。
+        # 开发环境（直接 python gui_main.py）则保持原有行为：python star_railway_monitor.py
+        if getattr(_sys, 'frozen', False):
+            cli = [_sys.executable, "--run-monitor"]
+        else:
+            cli = [_sys.executable,
+                   _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "star_railway_monitor.py")]
         cli += ["-a"] if cfg.get("auto_interface") else ["-i", str(cfg.get("interface_index",0))]
-        if cfg.get("load_vdata"):       cli.append("-lv")          # --load-vdata
-        if cfg.get("enumeration_mode"): cli.append("-enum")        # --enumeration-mode
-        if cfg.get("debug"):            cli.append("-d")           # --debug
+        if cfg.get("load_vdata"):       cli.append("-lv")            # --load-vdata
+        # 生成 vdata：仅在线模式（非 load_vdata）且用户勾选时才传入
+        # 双重保险：get_config() 已在离线时强制 False，此处再次校验
+        if cfg.get("generate_vdata") and not cfg.get("load_vdata"):
+            cli.append("-gv")                                        # --generate-vdata
+        if cfg.get("enumeration_mode"): cli.append("-enum")          # --enumeration-mode
+        if cfg.get("debug"):            cli.append("-d")             # --debug
         cat = cfg.get("category","全部")
-        if cat != "全部":               cli += ["-c", cat]         # --category
+        if cat != "全部":               cli += ["-c", cat]           # --category
         attrs = cfg.get("attributes",[])
-        if attrs:                       cli += ["-attr"] + attrs   # --attributes
+        if attrs:                       cli += ["-attr"] + attrs     # --attributes
         excl  = cfg.get("exclude_attributes",[])
-        if excl:                        cli += ["-exattr"] + excl  # --exclude-attributes
+        if excl:                        cli += ["-exattr"] + excl    # --exclude-attributes
         mc = cfg.get("match_count", 1)
-        cli += ["-mc", str(mc)]                                    # --match-count
+        cli += ["-mc", str(mc)]                                      # --match-count
         # 组合件数（修复问题2：combo_size 1-10 现在真正生效）
         cs = cfg.get("combo_size", 4)
-        cli += ["-cs", str(cs)]                                    # --combo-size
+        cli += ["-cs", str(cs)]                                      # --combo-size
         # 计算模式（修复问题1：计算模式选择现在真正生效）
         compute_mode = cfg.get("mode", "cpu")
-        cli += ["-cm", compute_mode]                               # --compute-mode
+        cli += ["-cm", compute_mode]                                 # --compute-mode
         mas = cfg.get("min_attr_sum",{})
         if mas:
             for k,v in mas.items():
-                cli += ["-mas", k, str(v)]                         # --min-attr-sum
+                cli += ["-mas", k, str(v)]                           # --min-attr-sum
 
         self.log_signal.emit(f"[INFO] 执行: {' '.join(cli)}")
 
@@ -850,7 +928,13 @@ class MonitorWorker(QThread):
                     proc.wait(timeout=3)
                 except Exception:
                     pass
-                self.log_signal.emit("[WARN] 用户中止操作")
+                # ── 保存已解析的结果（用户点停止时可能已解析到大部分数据）──
+                _flush_cur()
+                if results:
+                    self._results = results
+                    self.log_signal.emit(f"[WARN] 用户中止，已保存 {len(results)} 套已解析搭配")
+                else:
+                    self.log_signal.emit("[WARN] 用户中止操作")
                 self.done_signal.emit(); return
 
             # 非阻塞取行，超时 0.1s 后继续检查停止信号
@@ -940,7 +1024,10 @@ class MonitorWorker(QThread):
                 continue
 
         _flush_cur()
-        proc.wait()
+        rc = proc.wait()
+
+        if rc != 0 and rc is not None:
+            self.log_signal.emit(f"[WARN] 子进程退出码: {rc}")
 
         if results:
             self._results = results
@@ -977,6 +1064,22 @@ class ConfigPanel(QWidget):
         def lbl(t):
             l=QLabel(t); l.setStyleSheet(f"color:{TEXT2};font-size:12px;"); return l
 
+        # ── 配置备注 ──────────────────────────────────────
+        g_remark = QGroupBox("REMARK"); g_remark_l = QVBoxLayout(); g_remark_l.setContentsMargins(10,12,10,10); g_remark_l.setSpacing(4); g_remark.setLayout(g_remark_l)
+        remark_hint = QLabel("配置备注（将包含在导出的配置码中）")
+        remark_hint.setStyleSheet(f"color:{TEXT3};font-size:11px;")
+        g_remark_l.addWidget(remark_hint)
+        self.remark_edit = QTextEdit()
+        self.remark_edit.setPlaceholderText("在此输入备注，例如：适合治疗职业、高暴击流派……")
+        self.remark_edit.setFixedHeight(64)
+        self.remark_edit.setStyleSheet(
+            f"QTextEdit{{background:{BG3};color:{TEXT};border:1px solid {BORDER};"
+            f"border-radius:5px;font-size:12px;padding:4px;}}"
+            f"QTextEdit:focus{{border-color:{ACCENT2};}}")
+        self.remark_edit.textChanged.connect(lambda: self.config_changed.emit())
+        g_remark_l.addWidget(self.remark_edit)
+        lay.addWidget(g_remark)
+
         # ── 导入 / 导出配置码 ─────────────────────────────
         g0 = QGroupBox("CONFIG CODE"); g0l = QHBoxLayout(); g0l.setContentsMargins(10,12,10,10); g0l.setSpacing(8); g0.setLayout(g0l)
         btn_exp = QPushButton("⬆  导出配置码")
@@ -996,17 +1099,33 @@ class ConfigPanel(QWidget):
         # ── 网络接口 ─────────────────────────────────────
         g = QGroupBox("NETWORK INTERFACE"); gl = QVBoxLayout(); gl.setSpacing(6); gl.setContentsMargins(10,14,10,10); g.setLayout(gl)
         self.chk_auto = QCheckBox("自动选择接口（推荐）"); self.chk_auto.setChecked(True)
-        self.chk_auto.stateChanged.connect(lambda s: self.spin_iface.setEnabled(s==Qt.Unchecked))
+        # 兼容 PySide6 所有版本：int(s)==0 等价于 Qt.Unchecked，不依赖枚举比较
+        self.chk_auto.stateChanged.connect(
+            lambda s: self.spin_iface.setEnabled(int(s) == 0 and not self.chk_vdata.isChecked())
+        )
         gl.addWidget(self.chk_auto)
         row=QHBoxLayout()
         self.spin_iface=QSpinBox(); self.spin_iface.setRange(0,32); self.spin_iface.setValue(0)
         self.spin_iface.setEnabled(False); self.spin_iface.setFixedWidth(70)
-        btn_list=QPushButton("列出接口"); btn_list.setFixedHeight(28)
-        btn_list.setStyleSheet(f"QPushButton{{background:{BG2};color:{TEXT2};border:1px solid {BORDER};border-radius:5px;font-size:11px;padding:2px 8px;}}QPushButton:hover{{color:{ACCENT};border-color:{ACCENT2};}}")
-        btn_list.clicked.connect(self._list_ifaces)
-        row.addWidget(lbl("接口索引")); row.addWidget(self.spin_iface); row.addStretch(); row.addWidget(btn_list)
+        self.btn_list_iface=QPushButton("列出接口"); self.btn_list_iface.setFixedHeight(28)
+        self.btn_list_iface.setStyleSheet(f"QPushButton{{background:{BG2};color:{TEXT2};border:1px solid {BORDER};border-radius:5px;font-size:11px;padding:2px 8px;}}QPushButton:hover{{color:{ACCENT};border-color:{ACCENT2};}}")
+        self.btn_list_iface.clicked.connect(self._list_ifaces)
+        row.addWidget(lbl("接口索引")); row.addWidget(self.spin_iface); row.addStretch(); row.addWidget(self.btn_list_iface)
         gl.addLayout(row)
+
+        # ── 离线 / 在线模式切换 ──────────────────────────
         self.chk_vdata=QCheckBox("离线模式（读取 modules.vdata）"); gl.addWidget(self.chk_vdata)
+
+        # ── 「生成 vdata」—— 仅在线模式下可用 ────────────
+        self.chk_generate_vdata = QCheckBox("生成 vdata 文件（在线模式专属）")
+        self.chk_generate_vdata.setToolTip(
+            "在线模式下抓包成功后，将捕获到的模组数据保存为 modules.vdata。\n"
+            "离线模式下此选项自动禁用。")
+        gl.addWidget(self.chk_generate_vdata)
+
+        # 离线模式切换时同步更新相关控件状态
+        self.chk_vdata.stateChanged.connect(self._on_vdata_mode_changed)
+
         lay.addWidget(g)
 
         # ── 模组类型 ─────────────────────────────────────
@@ -1068,12 +1187,7 @@ class ConfigPanel(QWidget):
 
     def _export_config(self):
         cfg = self.get_config()
-        # 压缩导出：JSON → UTF-8 → zstd → base64，比纯 base64(json) 短 40~60%
-        import zstandard as _zstd
-        json_bytes = json.dumps(cfg, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
-        compressed = _zstd.ZstdCompressor(level=19).compress(json_bytes)
-        # 前缀 "Z1:" 标识 zstd 压缩格式，导入端据此区分新旧格式
-        code = "Z1:" + base64.b64encode(compressed).decode('ascii')
+        code = _encode_config(cfg)
         dlg = QDialog(self); dlg.setWindowTitle("导出配置码"); dlg.resize(500, 180)
         dlg.setStyleSheet(f"background:{BG2};color:{TEXT};")
         vl = QVBoxLayout(dlg); vl.setSpacing(10); vl.setContentsMargins(16,16,16,16)
@@ -1110,15 +1224,7 @@ class ConfigPanel(QWidget):
         def _do_import():
             code = te.toPlainText().strip()
             try:
-                if code.startswith("Z1:"):
-                    # 新格式：Z1: 前缀 + base64(zstd(json))
-                    import zstandard as _zstd
-                    compressed = base64.b64decode(code[3:].encode('ascii'))
-                    json_bytes = _zstd.ZstdDecompressor().decompress(compressed)
-                    cfg = json.loads(json_bytes.decode('utf-8'))
-                else:
-                    # 兼容旧格式：纯 base64(json)
-                    cfg = json.loads(base64.b64decode(code.encode()).decode())
+                cfg = _decode_config(code)
                 self.set_config(cfg)
                 dlg.accept()
             except Exception as e:
@@ -1133,7 +1239,16 @@ class ConfigPanel(QWidget):
         self.chk_auto.setChecked(bool(cfg.get("auto_interface", True)))
         self.spin_iface.setValue(int(cfg.get("interface_index", 0)))
         self.spin_iface.setEnabled(not bool(cfg.get("auto_interface", True)))
-        self.chk_vdata.setChecked(bool(cfg.get("load_vdata", False)))
+
+        # 先设 chk_vdata —— 这会触发 _on_vdata_mode_changed，
+        # 自动正确地 enable/disable 网络接口控件和 chk_generate_vdata
+        is_offline = bool(cfg.get("load_vdata", False))
+        self.chk_vdata.setChecked(is_offline)
+
+        # generate_vdata：只有在线模式（非 offline）下才允许为 True
+        want_gv = bool(cfg.get("generate_vdata", False)) and not is_offline
+        self.chk_generate_vdata.setChecked(want_gv)
+
         cat = cfg.get("category", "全部")
         idx = self.combo_cat.findText(cat)
         if idx >= 0: self.combo_cat.setCurrentIndex(idx)
@@ -1144,7 +1259,39 @@ class ConfigPanel(QWidget):
         self.chk_enum.setChecked(bool(cfg.get("enumeration_mode", False)))
         self.chk_debug.setChecked(bool(cfg.get("debug", False)))
         self.mas_widget.set_constraints(cfg.get("min_attr_sum", {}))
+        self.remark_edit.setPlainText(cfg.get("remark", ""))
         self.config_changed.emit()
+
+    def _on_vdata_mode_changed(self, state):
+        """离线 / 在线模式切换时，同步更新相关控件的 enable 状态。
+
+        规则（强约束）：
+        - 切到离线模式 → 禁用网络接口控件；强制清除并禁用「生成 vdata」
+        - 切回在线模式 → 恢复网络接口控件；开放「生成 vdata」
+
+        注意: PySide6 部分版本的 stateChanged 信号传递 int 而非 Qt.CheckState 枚举，
+        使用 int() 转换后与常量比较，兼容所有版本。
+        """
+        # 兼容写法：int(state) 在 PySide6 新旧版本下均可靠
+        is_offline = (int(state) == 2)   # Qt.Checked == 2
+
+        # ── 「生成 vdata」仅在线模式有效 ──────────────────
+        if is_offline:
+            # 强制取消勾选，防止残留状态污染下次在线执行
+            self.chk_generate_vdata.setChecked(False)
+        self.chk_generate_vdata.setEnabled(not is_offline)
+
+        # ── 网络接口控件：离线模式下无意义，全部禁用 ──────
+        self.chk_auto.setEnabled(not is_offline)
+        self.btn_list_iface.setEnabled(not is_offline)
+
+        # spin_iface 的状态取决于 is_offline 和 chk_auto 两个维度：
+        # - 离线模式下：始终禁用
+        # - 在线模式下：chk_auto 勾选时禁用（自动选接口），未勾选时启用（手动选接口）
+        if is_offline:
+            self.spin_iface.setEnabled(False)
+        else:
+            self.spin_iface.setEnabled(not self.chk_auto.isChecked())
 
     def _list_ifaces(self):
         try:
@@ -1164,10 +1311,14 @@ class ConfigPanel(QWidget):
             QMessageBox.warning(self,"提示",f"无法获取接口列表：{e}\n（请确认依赖已安装）")
 
     def get_config(self):
+        is_offline = self.chk_vdata.isChecked()
         return {
             "auto_interface":     self.chk_auto.isChecked(),
             "interface_index":    self.spin_iface.value(),
-            "load_vdata":         self.chk_vdata.isChecked(),
+            "load_vdata":         is_offline,
+            # 双重保险：即使 chk_generate_vdata 因 bug 保持勾选状态，
+            # 离线模式下也强制输出 False，杜绝误生成 vdata
+            "generate_vdata":     self.chk_generate_vdata.isChecked() and not is_offline,
             "category":           self.combo_cat.currentText(),
             "attributes":         self.attr_sel.get_selected(),
             "exclude_attributes": self.excl_sel.get_selected(),
@@ -1176,6 +1327,7 @@ class ConfigPanel(QWidget):
             "enumeration_mode":   self.chk_enum.isChecked(),
             "debug":              self.chk_debug.isChecked(),
             "min_attr_sum":       self.mas_widget.get_constraints(),
+            "remark":             self.remark_edit.toPlainText(),
         }
 
 # ═══════════════════════════════════════════════════════════
@@ -1270,7 +1422,7 @@ class OutputPanel(QWidget):
             base_score = 68
             base_bp    = 1294.0
             for r in range(1, 101):
-                chosen = _rnd.sample(_mod_pool, 4)
+                chosen = _rnd.sample(_mod_pool, min(combo_size, len(_mod_pool)))
                 modules = [{"name":n,"quality":q,"attrs":a} for n,q,a in chosen]
                 attr_sum: Dict[str,int] = {}
                 for mod in modules:
@@ -1290,12 +1442,12 @@ class OutputPanel(QWidget):
         QUAL_BDR    = {4: "#ffd70044", 3: "#b060ff44", 2: "#4488ff44", 1: BORDER}
 
         def _chip_style(aname: str):
-            """词条chip样式：极系蓝色 > 用户选中属性绿色高亮 > 普通灰色"""
-            if aname in set(SPECIAL_ATTRS):
-                return ACCENT_DIM, ACCENT, ACCENT2
+            """词条chip样式：仅用户选中的属性才高亮（极系蓝色 / 普通绿色），未选中一律灰色"""
             if aname in HL_ATTRS:
-                return "#003322", SUCCESS, "#00aa66"
-            return BG2, TEXT2, BORDER
+                if aname in set(SPECIAL_ATTRS):
+                    return ACCENT_DIM, ACCENT, ACCENT2   # 用户选中的极系词条 → 青色
+                return "#003322", SUCCESS, "#00aa66"     # 用户选中的普通词条 → 绿色
+            return BG2, TEXT2, BORDER                    # 未选中 → 灰色，不论是否为极系
 
         for res in results:
             rank     = res["rank"]
@@ -1397,18 +1549,18 @@ class OutputPanel(QWidget):
             for aname, total in attr_sum.items():
                 is_sp = aname in set(SPECIAL_ATTRS)
                 is_hl = aname in HL_ATTRS
-                if is_sp:
-                    bar_clr, txt_clr = ACCENT, ACCENT
+                if is_hl and is_sp:
+                    bar_clr, txt_clr = ACCENT, ACCENT    # 用户选中的极系词条 → 青色
                 elif is_hl:
-                    bar_clr, txt_clr = SUCCESS, SUCCESS
+                    bar_clr, txt_clr = SUCCESS, SUCCESS  # 用户选中的普通词条 → 绿色
                 else:
-                    bar_clr, txt_clr = TEXT2, TEXT2
+                    bar_clr, txt_clr = TEXT2, TEXT2      # 未选中 → 灰色，不论是否为极系
 
                 a_row = QHBoxLayout(); a_row.setSpacing(6)
                 name_l = QLabel(aname)
                 name_l.setStyleSheet(
                     f"color:{txt_clr};font-size:12px;min-width:110px;"
-                    + ("font-weight:600;" if (is_sp or is_hl) else ""))
+                    + ("font-weight:600;" if is_hl else ""))
                 name_l.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 a_row.addWidget(name_l)
                 val_l = QLabel(f"+{total}")
@@ -1782,7 +1934,6 @@ class MainWindow(QMainWindow):
 #  入口
 # ═══════════════════════════════════════════════════════════
 def main():
-    import multiprocessing as mp; mp.freeze_support()
     app=QApplication(sys.argv); app.setStyle("Fusion")
     pal=QPalette()
     pal.setColor(QPalette.Window,         QColor(BG))
@@ -1798,5 +1949,19 @@ def main():
     win=MainWindow(); win.show()
     sys.exit(app.exec())
 
-if __name__=="__main__":
-    main()
+if __name__ == "__main__":
+    # ── freeze_support 必须在最早期调用，否则 multiprocessing spawn 子进程会再次启动 GUI ──
+    import multiprocessing as _mp
+    _mp.freeze_support()
+
+    # ── 编译后单二进制调度 ──────────────────────────────────────────────────────────────
+    # PyInstaller 打包后只有一个 .exe，子进程无法直接执行 .py 脚本。
+    # MonitorWorker 启动监控器时会传入 --run-monitor 标志，在此拦截并转发给监控器，
+    # 避免 exe 以无参数模式运行时重新弹出 GUI 窗口。
+    if len(sys.argv) > 1 and sys.argv[1] == "--run-monitor":
+        # 去掉 --run-monitor，把剩余参数还给 star_railway_monitor 的 argparse
+        sys.argv = [sys.argv[0]] + sys.argv[2:]
+        from star_railway_monitor import main as _monitor_main
+        _monitor_main()
+    else:
+        main()

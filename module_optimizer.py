@@ -290,6 +290,8 @@ class ModuleOptimizer:
         # 如果使用了目标属性，在最终返回前恢复原始评分
         if self.target_attributes or self.min_attr_sum_requirements:
             result = self._restore_original_scores(result)
+            # 恢复原始评分后需重新排序（boost分数下的排序不代表原始分数排序）
+            result.sort(key=lambda x: x.score, reverse=True)
         
         self.logger.info(self._t(f"优化完成，返回{len(result)}个最优解", f"Optimization finished, returning {len(result)} best solutions"))
         
@@ -362,6 +364,8 @@ class ModuleOptimizer:
         # 如果使用了目标属性，在最终返回前恢复原始评分
         if self.target_attributes or self.min_attr_sum_requirements:
             result = self._restore_original_scores(result)
+            # 恢复原始评分后需重新排序
+            result.sort(key=lambda x: x.score, reverse=True)
         
         self.logger.info(self._t(f"优化完成，返回{len(result)}个最优解", f"Optimization finished, returning {len(result)} best solutions"))
         
@@ -372,9 +376,12 @@ class ModuleOptimizer:
 
         cpp_modules = self._convert_to_cpp_modules(modules)
 
-        # 目标属性 ID 集合
+        # 目标属性 ID 集合（含 min_attr_sum 的键，与 greedy 路径保持一致）
+        boost_attr_names: Set[str] = set(self.target_attributes or [])
+        if self.min_attr_sum_requirements:
+            boost_attr_names.update(self.min_attr_sum_requirements.keys())
         target_attrs_set = set(
-            MODULE_ATTR_IDS[a] for a in self.target_attributes if a in MODULE_ATTR_IDS
+            MODULE_ATTR_IDS[a] for a in boost_attr_names if a in MODULE_ATTR_IDS
         )
         # 排除属性 ID 集合
         exclude_attrs_set = set(

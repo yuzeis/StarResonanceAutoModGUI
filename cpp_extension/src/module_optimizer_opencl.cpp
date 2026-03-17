@@ -117,8 +117,12 @@ static void CalculateOptimalParamsOpenCL(GpuConfigOpenCL* config, unsigned long 
     }
     
     // 计算优化的批处理大小
+    // 每个 batch entry 需要: scores(int) + indices(slots_per_sol * ulong) + flags(uchar)
+    // 加上固定的 compact 缓冲区开销（使用 max_solutions * 8 估计）
     size_t available_memory = (size_t)(config->global_memory * 0.5);
-    unsigned long long memory_limited_batch = available_memory / (sizeof(int) + sizeof(unsigned long long));
+    // slots_per_sol 上限 3 (combo_size ≤ 10)
+    size_t bytes_per_entry = sizeof(int) + 3ULL * sizeof(unsigned long long) + sizeof(unsigned char);
+    unsigned long long memory_limited_batch = available_memory / bytes_per_entry;
     
     // 基于计算能力的批处理大小
     unsigned long long compute_limited_batch = max_global_threads * 3000ULL;
@@ -377,10 +381,13 @@ __kernel void histogram_byte_radix(
     barrier(CLK_LOCAL_MEM_FENCE);
     int shift = byte_idx * 8;
     for (ulong idx = gid; idx < n; idx += gsz) {
-        uint s = (uint)scores[idx];
-        if ((s & prefix_mask) == prefix_value) {
-            uint bucket = (s >> shift) & 0xFFU;
-            atomic_inc((volatile __local uint *)&s_hist[bucket]);
+        int score = scores[idx];
+        if (score >= 0) {
+            uint s = (uint)score;
+            if ((s & prefix_mask) == prefix_value) {
+                uint bucket = (s >> shift) & 0xFFU;
+                atomic_inc((volatile __local uint *)&s_hist[bucket]);
+            }
         }
     }
     barrier(CLK_LOCAL_MEM_FENCE);
@@ -397,7 +404,7 @@ __kernel void flag_scores_by_threshold(
     size_t gid = get_global_id(0);
     size_t gsz = get_global_size(0);
     for (ulong i = gid; i < n; i += gsz)
-        flags[i] = (uchar)((scores[i] >= threshold) ? 1 : 0);
+        flags[i] = (uchar)((scores[i] >= 0 && scores[i] >= threshold) ? 1 : 0);
 }
 
 /* compact_selected: slots_per_sol 个 ulong 对应一个解，需要全部拷贝 */
@@ -407,6 +414,7 @@ __kernel void compact_selected(
     __global const uchar * restrict flags,
     ulong n,
     int slots_per_sol,
+    int compact_cap,
     __global int * restrict out_scores,
     __global ulong * restrict out_indices,
     __global uint * restrict out_count) {
@@ -415,9 +423,11 @@ __kernel void compact_selected(
     for (ulong i = gid; i < n; i += gsz) {
         if (flags[i]) {
             uint pos = (uint)atomic_inc((volatile __global int *)out_count);
-            out_scores[pos] = scores[i];
-            for (int s = 0; s < slots_per_sol; ++s)
-                out_indices[pos * slots_per_sol + s] = indices[i * slots_per_sol + s];
+            if ((int)pos < compact_cap) {
+                out_scores[pos] = scores[i];
+                for (int s = 0; s < slots_per_sol; ++s)
+                    out_indices[pos * slots_per_sol + s] = indices[i * slots_per_sol + s];
+            }
         }
     }
 }
@@ -609,10 +619,13 @@ __kernel void compact_selected(
         cl_mem d_selected_count = clCreateBuffer(ctx, CL_MEM_READ_WRITE, sizeof(cl_uint), nullptr, &err);
         cl_uint zero_u = 0;
         clEnqueueWriteBuffer(q, d_selected_count, CL_TRUE, 0, sizeof(cl_uint), &zero_u, 0, nullptr, nullptr);
-        cl_mem d_comp_scores  = clCreateBuffer(ctx, CL_MEM_READ_WRITE, sizeof(int) * outN, nullptr, &err);
+        // compact 输出缓冲区：Radix Top-K 保证 flag 数量约为 max_solutions，
+        // 乘以 8 应对 tie 情况，上限 outN
+        int compact_cap = std::min((int)outN, max_solutions * 8);
+        cl_mem d_comp_scores  = clCreateBuffer(ctx, CL_MEM_READ_WRITE, sizeof(int) * compact_cap, nullptr, &err);
         // compact 输出同样需要 slots_per_sol 个 ulong/解
         cl_mem d_comp_indices = clCreateBuffer(ctx, CL_MEM_READ_WRITE,
-                                               sizeof(unsigned long long) * outN * slots_per_sol, nullptr, &err);
+                                               sizeof(unsigned long long) * compact_cap * slots_per_sol, nullptr, &err);
         if (!d_comp_scores || !d_comp_indices || err != CL_SUCCESS) {
             if (d_comp_indices) clReleaseMemObject(d_comp_indices);
             if (d_comp_scores)  clReleaseMemObject(d_comp_scores);
@@ -625,7 +638,8 @@ __kernel void compact_selected(
         clSetKernelArg(k_compact, carg++, sizeof(cl_mem), &d_indices);
         clSetKernelArg(k_compact, carg++, sizeof(cl_mem), &d_flags);
         clSetKernelArg(k_compact, carg++, sizeof(cl_ulong), &n64);
-        clSetKernelArg(k_compact, carg++, sizeof(int),     &slots_per_sol); // 新增
+        clSetKernelArg(k_compact, carg++, sizeof(int),     &slots_per_sol);
+        clSetKernelArg(k_compact, carg++, sizeof(int),     &compact_cap);   // 容量上限
         clSetKernelArg(k_compact, carg++, sizeof(cl_mem),  &d_comp_scores);
         clSetKernelArg(k_compact, carg++, sizeof(cl_mem),  &d_comp_indices);
         clSetKernelArg(k_compact, carg++, sizeof(cl_mem),  &d_selected_count);
@@ -641,6 +655,8 @@ __kernel void compact_selected(
         cl_uint h_selected = 0;
         clEnqueueReadBuffer(q, d_selected_count, CL_TRUE, 0, sizeof(cl_uint), &h_selected, 0, nullptr, nullptr);
         clFinish(q);
+        // 实际写入量可能超过 compact_cap（atomic_inc 无条件自增），只读有效部分
+        if (h_selected > (cl_uint)compact_cap) h_selected = (cl_uint)compact_cap;
 
         if (h_selected > 0) {
             size_t selN = (size_t)h_selected;

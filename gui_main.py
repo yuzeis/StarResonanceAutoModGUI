@@ -10,8 +10,6 @@ import math
 import threading
 import logging
 import random
-import json
-import base64
 from typing import List, Optional, Dict
 
 _PROJ_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -51,84 +49,13 @@ OPENCL_CLR = "#ffaa44"
 CPU_CLR    = "#6699ff"
 
 # ═══════════════════════════════════════════════════════════
-#  属性/类型数据
+#  属性/类型数据 + 配置码编解码  →  独立模块 config_codec.py
 # ═══════════════════════════════════════════════════════════
-BASIC_ATTRS = [
-    "力量加持","敏捷加持","智力加持",
-    "特攻伤害","精英打击",
-    "特攻治疗加持","专精治疗加持",
-    "施法专注","攻速专注","暴击专注","幸运专注",
-    "抵御魔法","抵御物理",
-]
-SPECIAL_ATTRS = [
-    "极-绝境守护","极-伤害叠加","极-灵活身法",
-    "极-生命凝聚","极-急救措施","极-生命波动",
-    "极-生命汲取","极-全队幸暴",
-]
-ALL_ATTRS  = BASIC_ATTRS + SPECIAL_ATTRS
-CATEGORIES = ["全部","攻击","守护","辅助"]
-
-# ── 配置码：属性名 ↔ 2字符缩写（用于语义压缩，降低配置码长度）─────────────────
-_ATTR_ABBR: dict[str, str] = {
-    "力量加持":     "a1", "敏捷加持":     "a2", "智力加持":     "a3",
-    "特攻伤害":     "a4", "精英打击":     "a5",
-    "特攻治疗加持": "a6", "专精治疗加持": "a7",
-    "施法专注":     "a8", "攻速专注":     "a9", "暴击专注":     "aa",
-    "幸运专注":     "ab", "抵御魔法":     "ac", "抵御物理":     "ad",
-    "极-绝境守护":  "b1", "极-伤害叠加":  "b2", "极-灵活身法":  "b3",
-    "极-生命凝聚":  "b4", "极-急救措施":  "b5", "极-生命波动":  "b6",
-    "极-生命汲取":  "b7", "极-全队幸暴":  "b8",
-}
-_ABBR_ATTR: dict[str, str] = {v: k for k, v in _ATTR_ABBR.items()}
-
-# 配置项默认值（导出时跳过与默认值相同的项，减小体积）
-_CFG_DEFAULTS: dict = {
-    "auto_interface": True, "interface_index": 0, "load_vdata": False,
-    "generate_vdata": False, "category": "全部", "attributes": [],
-    "exclude_attributes": [], "match_count": 1, "combo_size": 4,
-    "enumeration_mode": False, "debug": False, "min_attr_sum": {}, "remark": "",
-}
-
-def _encode_config(cfg: dict) -> str:
-    """配置 → 配置码（Z4: 前缀）
-    流程: 去默认值 → 属性名缩写 → JSON → zstd(19) → base85
-    """
-    import zstandard as _zstd
-    mini: dict = {}
-    for k, v in cfg.items():
-        if v == _CFG_DEFAULTS.get(k):
-            continue
-        if k in ("attributes", "exclude_attributes"):
-            v = [_ATTR_ABBR.get(a, a) for a in v]
-        elif k == "min_attr_sum":
-            v = {_ATTR_ABBR.get(a, a): n for a, n in v.items()}
-        mini[k] = v
-    json_bytes = json.dumps(mini, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
-    compressed = _zstd.ZstdCompressor(level=19).compress(json_bytes)
-    return "Z4:" + base64.b85encode(compressed).decode('ascii')
-
-def _decode_config(code: str) -> dict:
-    """配置码 → 配置字典，兼容 Z4 / Z1 / 旧 base64 三种格式"""
-    import zstandard as _zstd
-    if code.startswith("Z4:"):
-        compressed = base64.b85decode(code[3:].encode('ascii'))
-        json_bytes = _zstd.ZstdDecompressor().decompress(compressed)
-        mini = json.loads(json_bytes.decode('utf-8'))
-        # 还原缩写 + 补全默认值
-        cfg = dict(_CFG_DEFAULTS)
-        for k, v in mini.items():
-            if k in ("attributes", "exclude_attributes"):
-                v = [_ABBR_ATTR.get(a, a) for a in v]
-            elif k == "min_attr_sum":
-                v = {_ABBR_ATTR.get(a, a): n for a, n in v.items()}
-            cfg[k] = v
-        return cfg
-    if code.startswith("Z1:"):
-        compressed = base64.b64decode(code[3:].encode('ascii'))
-        json_bytes = _zstd.ZstdDecompressor().decompress(compressed)
-        return json.loads(json_bytes.decode('utf-8'))
-    # 最旧格式：纯 base64(json)
-    return json.loads(base64.b64decode(code.encode()).decode())
+from config_codec import (
+    BASIC_ATTRS, SPECIAL_ATTRS, ALL_ATTRS, CATEGORIES, CFG_DEFAULTS,
+    encode_config as _encode_config,
+    decode_config as _decode_config,
+)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1032,9 +959,16 @@ class MonitorWorker(QThread):
         if results:
             self._results = results
             self.log_signal.emit(f"[INFO] ✓ 解析到 {len(results)} 套搭配")
+        elif rc != 0 and rc is not None:
+            # 子进程异常退出且无结果 → 明确标记为失败，不展示演示数据
+            self._results = None
+            self.log_signal.emit(f"[ERR] 子进程异常退出 (exit code={rc})，未获取到计算结果")
+            self.error_signal.emit(f"子进程异常退出 (exit code={rc})")
+            self.progress_signal.emit(0, "失败")
+            self.done_signal.emit(); return
         else:
             self._results = None
-            self.log_signal.emit("[INFO] ✓ 优化完成（结果将以演示数据展示）")
+            self.log_signal.emit("[INFO] ✓ 优化完成（未找到匹配搭配，结果以演示数据展示）")
 
         self.progress_signal.emit(100,"完成")
         self.done_signal.emit()

@@ -82,6 +82,10 @@ std::vector<CompactSolution> ModuleOptimizerCpp::ProcessCombinationRange(
     size_t r = static_cast<size_t>(combo_size);
     size_t range_size = end_combination - start_combination;
 
+    // ── 热路径优化：将 unordered_set 转为 O(1) 位图查找 ──
+    AttrBitmap target_bm = AttrBitmap::from_set(target_attributes);
+    AttrBitmap exclude_bm = AttrBitmap::from_set(exclude_attributes);
+
     std::vector<CompactSolution> solution;
     // ext_space 控制 nth_element 裁剪前允许的超额条目数
     // 过大会导致内存峰值翻倍；使用 min(cap/2, 2048) 平衡裁剪频率和内存
@@ -94,7 +98,7 @@ std::vector<CompactSolution> ModuleOptimizerCpp::ProcessCombinationRange(
     GetCombinationByIndex(n, r, start_combination, tmp);
     for (size_t j = 0; j < r; ++j) cb[j] = static_cast<uint16_t>(tmp[j]);
 
-    // 评分 lambda
+    // 评分 lambda（使用位图替代 unordered_set/unordered_map 查找）
     auto score_combo = [&]() -> int {
         int attr_ids[80] = {}, attr_vals[80] = {};
         int attr_cnt = 0, total_attr_value = 0;
@@ -112,12 +116,12 @@ std::vector<CompactSolution> ModuleOptimizerCpp::ProcessCombinationRange(
             int max_level = 0;
             for (int lv = 0; lv < 6; ++lv) { if (av >= Constants::ATTR_THRESHOLDS[lv]) max_level = lv+1; else break; }
             if (max_level > 0) {
-                bool is_sp = Constants::SPECIAL_ATTR_NAMES.count(aid) > 0;
+                bool is_sp = Constants::IsSpecialAttr(aid);
                 int bp = is_sp ? Constants::SPECIAL_ATTR_POWER_VALUES[max_level-1]
                                : Constants::BASIC_ATTR_POWER_VALUES[max_level-1];
-                if (!target_attributes.empty() && target_attributes.count(aid))
+                if (target_bm.contains(aid))
                     threshold_power += bp * 2;
-                else if (!exclude_attributes.empty() && exclude_attributes.count(aid))
+                else if (exclude_bm.contains(aid))
                     threshold_power += 0;
                 else
                     threshold_power += bp;
@@ -244,7 +248,7 @@ int ModuleOptimizerCpp::CalculateCombatPowerByIndices(
         int max_level=0;
         for(int lv=0;lv<6;++lv){if(av>=Constants::ATTR_THRESHOLDS[lv])max_level=lv+1;else break;}
         if(max_level>0){
-            bool is_sp=Constants::SPECIAL_ATTR_NAMES.count(aid)>0;
+            bool is_sp=Constants::IsSpecialAttr(aid);
             int bp=is_sp?Constants::SPECIAL_ATTR_POWER_VALUES[max_level-1]:Constants::BASIC_ATTR_POWER_VALUES[max_level-1];
             if(!target_attributes.empty()&&target_attributes.count(aid)) threshold_power+=bp*2;
             else if(!exclude_attributes.empty()&&exclude_attributes.count(aid)) threshold_power+=0;
@@ -255,17 +259,38 @@ int ModuleOptimizerCpp::CalculateCombatPowerByIndices(
     return threshold_power + Constants::TOTAL_ATTR_POWER_VALUES[capped];
 }
 
-int ModuleOptimizerCpp::CalculateCombatPowerByPackedIndices(
-    uint64_t packed_indices,
+// 位图版评分：热路径专用（贪心+局部搜索每次运行调用数百万次）
+int ModuleOptimizerCpp::ScoreByIndicesBitmap(
+    const std::vector<size_t>& indices,
     const std::vector<ModuleInfo>& modules,
-    const std::unordered_set<int>& target_attributes,
-    const std::unordered_set<int>& exclude_attributes,
-    int combo_size) {
-    std::vector<size_t> idx_vec;
-    size_t pack_n = static_cast<size_t>(std::min(combo_size, 4));
-    for (size_t i = 0; i < pack_n; ++i)
-        idx_vec.push_back(static_cast<size_t>((packed_indices>>(i*16))&0xFFFF));
-    return CalculateCombatPowerByIndices(idx_vec, modules, target_attributes, exclude_attributes);
+    const AttrBitmap& target_bm,
+    const AttrBitmap& exclude_bm) {
+
+    int attr_values[80]={}, attr_ids[80]={};
+    int attr_count=0, total_attr_value=0;
+    for (size_t index : indices) {
+        for (const auto& part : modules[index].parts) {
+            bool found = false;
+            for (int i=0;i<attr_count;++i){if(attr_ids[i]==part.id){attr_values[i]+=part.value;found=true;break;}}
+            if (!found && attr_count<80){attr_ids[attr_count]=part.id;attr_values[attr_count]=part.value;++attr_count;}
+            total_attr_value += part.value;
+        }
+    }
+    int threshold_power = 0;
+    for (int i=0;i<attr_count;++i){
+        int av=attr_values[i],aid=attr_ids[i];
+        int max_level=0;
+        for(int lv=0;lv<6;++lv){if(av>=Constants::ATTR_THRESHOLDS[lv])max_level=lv+1;else break;}
+        if(max_level>0){
+            bool is_sp=Constants::IsSpecialAttr(aid);
+            int bp=is_sp?Constants::SPECIAL_ATTR_POWER_VALUES[max_level-1]:Constants::BASIC_ATTR_POWER_VALUES[max_level-1];
+            if(target_bm.contains(aid)) threshold_power+=bp*2;
+            else if(exclude_bm.contains(aid)) threshold_power+=0;
+            else threshold_power+=bp;
+        }
+    }
+    int capped = std::min(total_attr_value, 120);
+    return threshold_power + Constants::TOTAL_ATTR_POWER_VALUES[capped];
 }
 
 // StrategyEnumeration: CPU多线程，支持1~10件
@@ -346,6 +371,80 @@ std::vector<ModuleSolution> ModuleOptimizerCpp::StrategyEnumeration(
     return final_solutions;
 }
 
+// ── GPU 共用工具方法 ────────────────────────────────────────────────────────
+
+ModuleOptimizerCpp::FlatModuleData ModuleOptimizerCpp::FlattenModulesForGpu(
+    const std::vector<ModuleInfo>& modules,
+    const std::unordered_set<int>& target_attributes,
+    const std::unordered_set<int>& exclude_attributes,
+    const std::unordered_map<int, int>& min_attr_sum_requirements) {
+    FlatModuleData d;
+    size_t current_offset = 0;
+    for (const auto& module : modules) {
+        d.offsets.push_back(static_cast<int>(current_offset));
+        d.attr_counts.push_back(static_cast<int>(module.parts.size()));
+        for (const auto& part : module.parts) {
+            d.attr_ids.push_back(part.id);
+            d.attr_values.push_back(part.value);
+        }
+        current_offset += module.parts.size();
+    }
+    d.target_vec.assign(target_attributes.begin(), target_attributes.end());
+    d.exclude_vec.assign(exclude_attributes.begin(), exclude_attributes.end());
+    for (const auto& kv : min_attr_sum_requirements) {
+        d.min_ids.push_back(kv.first);
+        d.min_values.push_back(kv.second);
+    }
+    return d;
+}
+
+std::vector<ModuleSolution> ModuleOptimizerCpp::UnpackGpuSolutions(
+    const std::vector<int>& gpu_scores,
+    const std::vector<long long>& gpu_indices,
+    int gpu_result_count,
+    int combo_size,
+    int slots_per_sol,
+    const std::vector<ModuleInfo>& modules,
+    const std::unordered_set<int>& target_attributes,
+    const std::unordered_set<int>& exclude_attributes,
+    const char* backend_name) {
+    std::vector<ModuleSolution> final_solutions;
+    final_solutions.reserve(static_cast<size_t>(gpu_result_count));
+    for (int i = 0; i < gpu_result_count; ++i) {
+        std::vector<ModuleInfo> sol_mods;
+        std::vector<size_t> sol_indices;
+        sol_indices.reserve(static_cast<size_t>(combo_size));
+        for (int slot = 0; slot < slots_per_sol; ++slot) {
+            long long packed = gpu_indices[static_cast<size_t>(i) * slots_per_sol + slot];
+            int in_slot = std::min(4, combo_size - slot * 4);
+            for (int j = 0; j < in_slot; ++j) {
+                size_t module_idx = static_cast<size_t>((packed >> (j * 16)) & 0xFFFF);
+                if (module_idx < modules.size()) {
+                    sol_mods.push_back(modules[module_idx]);
+                    sol_indices.push_back(module_idx);
+                }
+            }
+        }
+        if (static_cast<int>(sol_mods.size()) != combo_size ||
+            static_cast<int>(sol_indices.size()) != combo_size) {
+            continue;
+        }
+        int exact_score = CalculateCombatPowerByIndices(
+            sol_indices, modules, target_attributes, exclude_attributes);
+        auto result = CalculateCombatPower(sol_mods);
+        if (exact_score != gpu_scores[i]) {
+            printf("%s score mismatch: gpu=%d cpu=%d (solution #%d)\n",
+                   backend_name, gpu_scores[i], exact_score, i);
+        }
+        final_solutions.emplace_back(sol_mods, exact_score, result.second);
+    }
+    std::sort(final_solutions.begin(), final_solutions.end(),
+              [](const ModuleSolution& a, const ModuleSolution& b) {
+                  return a.score > b.score;
+              });
+    return final_solutions;
+}
+
 // StrategyEnumerationCUDA: 支持1~10件
 std::vector<ModuleSolution> ModuleOptimizerCpp::StrategyEnumerationCUDA(
     const std::vector<ModuleInfo>& modules,
@@ -358,77 +457,26 @@ std::vector<ModuleSolution> ModuleOptimizerCpp::StrategyEnumerationCUDA(
 #ifdef USE_CUDA
     if (TestCuda()) {
         printf("CUDA GPU acceleration enabled (combo_size=%d)\n", combo_size);
-        std::vector<int> all_attr_ids, all_attr_values, module_attr_counts, module_offsets;
-        size_t current_offset = 0;
-        for (const auto& module : modules) {
-            module_offsets.push_back(static_cast<int>(current_offset));
-            module_attr_counts.push_back(static_cast<int>(module.parts.size()));
-            for (const auto& part : module.parts) {
-                all_attr_ids.push_back(part.id);
-                all_attr_values.push_back(part.value);
-            }
-            current_offset += module.parts.size();
-        }
-        std::vector<int> target_attrs(target_attributes.begin(), target_attributes.end());
-        std::vector<int> exclude_attrs(exclude_attributes.begin(), exclude_attributes.end());
-        std::vector<int> min_attr_ids, min_attr_values;
-        for (const auto& kv : min_attr_sum_requirements) {
-            min_attr_ids.push_back(kv.first); min_attr_values.push_back(kv.second);
-        }
-        // 分配结果数组：每解需 ceil(combo_size/4) 个 long long 存索引
+        auto flat = FlattenModulesForGpu(modules, target_attributes, exclude_attributes, min_attr_sum_requirements);
         int slots_per_solution = (combo_size + 3) / 4;
         std::vector<int> gpu_scores(max_solutions);
         std::vector<long long> gpu_indices(static_cast<size_t>(max_solutions) * slots_per_solution);
 
         int gpu_result_count = GpuStrategyEnumeration(
-            all_attr_ids.data(), all_attr_values.data(),
-            module_attr_counts.data(), module_offsets.data(),
-            static_cast<int>(modules.size()), static_cast<int>(all_attr_ids.size()),
-            target_attrs.empty() ? nullptr : target_attrs.data(), static_cast<int>(target_attrs.size()),
-            exclude_attrs.empty() ? nullptr : exclude_attrs.data(), static_cast<int>(exclude_attrs.size()),
-            min_attr_ids.empty() ? nullptr : min_attr_ids.data(),
-            min_attr_values.empty() ? nullptr : min_attr_values.data(),
-            static_cast<int>(min_attr_ids.size()),
+            flat.attr_ids.data(), flat.attr_values.data(),
+            flat.attr_counts.data(), flat.offsets.data(),
+            static_cast<int>(modules.size()), static_cast<int>(flat.attr_ids.size()),
+            flat.target_vec.empty() ? nullptr : flat.target_vec.data(), static_cast<int>(flat.target_vec.size()),
+            flat.exclude_vec.empty() ? nullptr : flat.exclude_vec.data(), static_cast<int>(flat.exclude_vec.size()),
+            flat.min_ids.empty() ? nullptr : flat.min_ids.data(),
+            flat.min_values.empty() ? nullptr : flat.min_values.data(),
+            static_cast<int>(flat.min_ids.size()),
             combo_size,
             max_solutions,
             gpu_scores.data(), gpu_indices.data());
 
-        std::vector<ModuleSolution> final_solutions;
-        final_solutions.reserve(gpu_result_count);
-        for (int i = 0; i < gpu_result_count; ++i) {
-            std::vector<ModuleInfo> sol_mods;
-            std::vector<size_t> sol_indices;
-            sol_indices.reserve(static_cast<size_t>(combo_size));
-            // 每解 combo_size 个索引，按 slots_per_solution 个 long long 打包
-            for (int slot = 0; slot < slots_per_solution; ++slot) {
-                long long packed = gpu_indices[static_cast<size_t>(i) * slots_per_solution + slot];
-                int in_slot = std::min(4, combo_size - slot * 4);
-                for (int j = 0; j < in_slot; ++j) {
-                    size_t module_idx = static_cast<size_t>((packed >> (j * 16)) & 0xFFFF);
-                    if (module_idx < modules.size()) {
-                        sol_mods.push_back(modules[module_idx]);
-                        sol_indices.push_back(module_idx);
-                    }
-                }
-            }
-            if (static_cast<int>(sol_mods.size()) != combo_size ||
-                static_cast<int>(sol_indices.size()) != combo_size) {
-                continue;
-            }
-            int exact_score = CalculateCombatPowerByIndices(
-                sol_indices, modules, target_attributes, exclude_attributes);
-            auto result = CalculateCombatPower(sol_mods);
-            if (exact_score != gpu_scores[i]) {
-                printf("CUDA score mismatch: gpu=%d cpu=%d (solution #%d)\n",
-                       gpu_scores[i], exact_score, i);
-            }
-            final_solutions.emplace_back(sol_mods, exact_score, result.second);
-        }
-        std::sort(final_solutions.begin(), final_solutions.end(),
-                  [](const ModuleSolution& a, const ModuleSolution& b) {
-                      return a.score > b.score;
-                  });
-        return final_solutions;
+        return UnpackGpuSolutions(gpu_scores, gpu_indices, gpu_result_count,
+            combo_size, slots_per_solution, modules, target_attributes, exclude_attributes, "CUDA");
     }
     printf("CUDA not available, falling back to CPU\n");
 #endif
@@ -469,15 +517,19 @@ std::vector<ModuleSolution> ModuleOptimizerCpp::OptimizeModules(
     int max_solutions, int max_attempts_multiplier, int local_search_iterations,
     int combo_size) {
 
+    // ── 热路径优化：构建位图一次，贪心/局部搜索全程复用 ──
+    AttrBitmap target_bm = AttrBitmap::from_set(target_attributes);
+    AttrBitmap exclude_bm = AttrBitmap::from_set(exclude_attributes);
+
     auto candidate_modules = modules;
     std::vector<LightweightSolution> lightweight_solutions;
     std::set<std::vector<size_t>> seen_combinations;
     int max_attempts = max_solutions * max_attempts_multiplier, attempts = 0;
     while (lightweight_solutions.size() < static_cast<size_t>(max_solutions) && attempts < max_attempts) {
         ++attempts;
-        auto solution = GreedyConstructSolutionByIndices(candidate_modules, target_attributes, exclude_attributes, combo_size);
+        auto solution = GreedyConstructBitmap(candidate_modules, target_bm, exclude_bm, combo_size);
         if (solution.module_indices.empty()) continue;
-        auto improved = LocalSearchImproveByIndices(solution, candidate_modules, local_search_iterations, target_attributes, exclude_attributes);
+        auto improved = LocalSearchBitmap(solution, candidate_modules, local_search_iterations, target_bm, exclude_bm);
         if (IsCombinationUnique(improved.module_indices, seen_combinations)) {
             auto si = improved.module_indices; std::sort(si.begin(), si.end());
             seen_combinations.insert(si); lightweight_solutions.push_back(improved);
@@ -496,10 +548,11 @@ std::vector<ModuleSolution> ModuleOptimizerCpp::OptimizeModules(
     return solutions;
 }
 
-LightweightSolution ModuleOptimizerCpp::GreedyConstructSolutionByIndices(
+// ── 位图版贪心构造 ──────────────────────────────────────────────────────
+LightweightSolution ModuleOptimizerCpp::GreedyConstructBitmap(
     const std::vector<ModuleInfo>& modules,
-    const std::unordered_set<int>& target_attributes,
-    const std::unordered_set<int>& exclude_attributes,
+    const AttrBitmap& target_bm,
+    const AttrBitmap& exclude_bm,
     int combo_size) {
     if (modules.empty() || combo_size <= 0) {
         return LightweightSolution({}, 0);
@@ -518,7 +571,7 @@ LightweightSolution ModuleOptimizerCpp::GreedyConstructSolutionByIndices(
             if (dup) continue;
             auto test = current_indices; test.push_back(mi);
             candidates.push_back(mi);
-            scores.push_back(CalculateCombatPowerByIndices(test, modules, target_attributes, exclude_attributes));
+            scores.push_back(ScoreByIndicesBitmap(test, modules, target_bm, exclude_bm));
         }
         if (candidates.empty()) break;
         if (dis(gen) < 0.8) {
@@ -532,12 +585,13 @@ LightweightSolution ModuleOptimizerCpp::GreedyConstructSolutionByIndices(
         }
     }
     return LightweightSolution(current_indices,
-        CalculateCombatPowerByIndices(current_indices, modules, target_attributes, exclude_attributes));
+        ScoreByIndicesBitmap(current_indices, modules, target_bm, exclude_bm));
 }
 
-LightweightSolution ModuleOptimizerCpp::LocalSearchImproveByIndices(
+// ── 位图版局部搜索 ──────────────────────────────────────────────────────
+LightweightSolution ModuleOptimizerCpp::LocalSearchBitmap(
     const LightweightSolution& solution, const std::vector<ModuleInfo>& all_modules,
-    int iterations, const std::unordered_set<int>& target_attributes, const std::unordered_set<int>& exclude_attributes) {
+    int iterations, const AttrBitmap& target_bm, const AttrBitmap& exclude_bm) {
     LightweightSolution best = solution;
     std::random_device rd; std::mt19937 gen(rd());
     std::uniform_int_distribution<> module_dis(0, static_cast<int>(all_modules.size()) - 1);
@@ -551,7 +605,7 @@ LightweightSolution ModuleOptimizerCpp::LocalSearchImproveByIndices(
                 for (size_t ei : best.module_indices) { if (ei==new_idx){dup=true;break;} }
                 if (dup) continue;
                 auto ni = best.module_indices; ni[i] = new_idx;
-                int ns = CalculateCombatPowerByIndices(ni, all_modules, target_attributes, exclude_attributes);
+                int ns = ScoreByIndicesBitmap(ni, all_modules, target_bm, exclude_bm);
                 if (ns > best.score) { best = LightweightSolution(ni, ns); improved = true; break; }
             }
             if (improved) break;
@@ -559,6 +613,25 @@ LightweightSolution ModuleOptimizerCpp::LocalSearchImproveByIndices(
         if (!improved && it > iterations/2) break;
     }
     return best;
+}
+
+// ── 旧接口兼容（内部转 bitmap 委托） ────────────────────────────────────
+LightweightSolution ModuleOptimizerCpp::GreedyConstructSolutionByIndices(
+    const std::vector<ModuleInfo>& modules,
+    const std::unordered_set<int>& target_attributes,
+    const std::unordered_set<int>& exclude_attributes,
+    int combo_size) {
+    return GreedyConstructBitmap(modules,
+        AttrBitmap::from_set(target_attributes),
+        AttrBitmap::from_set(exclude_attributes), combo_size);
+}
+
+LightweightSolution ModuleOptimizerCpp::LocalSearchImproveByIndices(
+    const LightweightSolution& solution, const std::vector<ModuleInfo>& all_modules,
+    int iterations, const std::unordered_set<int>& target_attributes, const std::unordered_set<int>& exclude_attributes) {
+    return LocalSearchBitmap(solution, all_modules, iterations,
+        AttrBitmap::from_set(target_attributes),
+        AttrBitmap::from_set(exclude_attributes));
 }
 
 bool ModuleOptimizerCpp::IsCombinationUnique(

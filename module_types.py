@@ -325,4 +325,15 @@ class ModuleInfo:
     def __lt__(self, other):
         if not isinstance(other, ModuleInfo):
             return NotImplemented
-        return self.uuid < other.uuid 
+        return self.uuid < other.uuid
+
+
+def tr(lang: str, zh: str, en: str) -> str:
+    """统一双语选择工具，替代各模块中分散定义的 _t / _tr 方法。
+
+    Args:
+        lang: 语言标识，'en' 返回英文，其余返回中文
+        zh:   中文字符串
+        en:   英文字符串
+    """
+    return en if lang == 'en' else zh

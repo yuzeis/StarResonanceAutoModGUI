@@ -731,93 +731,32 @@ std::vector<ModuleSolution> ModuleOptimizerCpp::StrategyEnumerationOpenCL(
 
     printf("OpenCL GPU acceleration enabled (combo_size=%d)\n", combo_size);
 
-    std::vector<int> all_attr_ids;
-    std::vector<int> all_attr_values;
-    std::vector<int> module_attr_counts;
-    std::vector<int> module_offsets;
-
-    size_t current_offset = 0;
-    for (const auto& module : modules) {
-        module_offsets.push_back(static_cast<int>(current_offset));
-        module_attr_counts.push_back(static_cast<int>(module.parts.size()));
-        for (const auto& part : module.parts) {
-            all_attr_ids.push_back(part.id);
-            all_attr_values.push_back(part.value);
-        }
-        current_offset += module.parts.size();
-    }
-
-    std::vector<int> target_attrs_vec(target_attributes.begin(), target_attributes.end());
-    std::vector<int> exclude_attrs_vec(exclude_attributes.begin(), exclude_attributes.end());
-    std::vector<int> min_attr_ids;
-    std::vector<int> min_attr_values;
-    for (const auto& kv : min_attr_sum_requirements) {
-        min_attr_ids.push_back(kv.first);
-        min_attr_values.push_back(kv.second);
-    }
-
-    int slots_per_sol = (combo_size + 3) / 4;  // ceil(combo_size/4)
+    auto flat = FlattenModulesForGpu(modules, target_attributes, exclude_attributes, min_attr_sum_requirements);
+    int slots_per_sol = (combo_size + 3) / 4;
     std::vector<int> gpu_scores(max_solutions);
     std::vector<long long> gpu_indices(static_cast<size_t>(max_solutions) * slots_per_sol);
 
-    int gpu_result_count = 0;
-#ifdef USE_OPENCL
-    gpu_result_count = GpuStrategyEnumerationOpenCL(
-        all_attr_ids.data(),
-        all_attr_values.data(),
-        module_attr_counts.data(),
-        module_offsets.data(),
+    int gpu_result_count = GpuStrategyEnumerationOpenCL(
+        flat.attr_ids.data(),
+        flat.attr_values.data(),
+        flat.attr_counts.data(),
+        flat.offsets.data(),
         static_cast<int>(modules.size()),
-        static_cast<int>(all_attr_ids.size()),
-        target_attrs_vec.empty() ? nullptr : target_attrs_vec.data(),
-        static_cast<int>(target_attrs_vec.size()),
-        exclude_attrs_vec.empty() ? nullptr : exclude_attrs_vec.data(),
-        static_cast<int>(exclude_attrs_vec.size()),
-        min_attr_ids.empty() ? nullptr : min_attr_ids.data(),
-        min_attr_values.empty() ? nullptr : min_attr_values.data(),
-        static_cast<int>(min_attr_ids.size()),
+        static_cast<int>(flat.attr_ids.size()),
+        flat.target_vec.empty() ? nullptr : flat.target_vec.data(),
+        static_cast<int>(flat.target_vec.size()),
+        flat.exclude_vec.empty() ? nullptr : flat.exclude_vec.data(),
+        static_cast<int>(flat.exclude_vec.size()),
+        flat.min_ids.empty() ? nullptr : flat.min_ids.data(),
+        flat.min_values.empty() ? nullptr : flat.min_values.data(),
+        static_cast<int>(flat.min_ids.size()),
         combo_size,
         max_solutions,
         gpu_scores.data(),
         gpu_indices.data());
-#endif
 
-    std::vector<ModuleSolution> final_solutions;
-    final_solutions.reserve(static_cast<size_t>(gpu_result_count));
-    for (int i = 0; i < gpu_result_count; ++i) {
-        std::vector<ModuleInfo> solution_modules;
-        std::vector<size_t> solution_indices;
-        solution_indices.reserve(static_cast<size_t>(combo_size));
-        // 按 slots_per_sol 解包索引
-        for (int slot = 0; slot < slots_per_sol; ++slot) {
-            long long packed = gpu_indices[static_cast<size_t>(i) * slots_per_sol + slot];
-            int in_slot = std::min(4, combo_size - slot * 4);
-            for (int j = 0; j < in_slot; ++j) {
-                size_t module_idx = static_cast<size_t>((packed >> (j * 16)) & 0xFFFF);
-                if (module_idx < modules.size()) {
-                    solution_modules.push_back(modules[module_idx]);
-                    solution_indices.push_back(module_idx);
-                }
-            }
-        }
-        if (static_cast<int>(solution_modules.size()) != combo_size ||
-            static_cast<int>(solution_indices.size()) != combo_size) {
-            continue;
-        }
-        int exact_score = CalculateCombatPowerByIndices(
-            solution_indices, modules, target_attributes, exclude_attributes);
-        auto result = CalculateCombatPower(solution_modules);
-        if (exact_score != gpu_scores[i]) {
-            printf("OpenCL score mismatch: gpu=%d cpu=%d (solution #%d)\n",
-                   gpu_scores[i], exact_score, i);
-        }
-        final_solutions.emplace_back(solution_modules, exact_score, result.second);
-    }
-    std::sort(final_solutions.begin(), final_solutions.end(),
-              [](const ModuleSolution& a, const ModuleSolution& b) {
-                  return a.score > b.score;
-              });
-    return final_solutions;
+    return UnpackGpuSolutions(gpu_scores, gpu_indices, gpu_result_count,
+        combo_size, slots_per_sol, modules, target_attributes, exclude_attributes, "OpenCL");
 #else
     (void)modules; (void)target_attributes; (void)exclude_attributes;
     (void)min_attr_sum_requirements; (void)max_solutions; (void)max_workers; (void)combo_size;

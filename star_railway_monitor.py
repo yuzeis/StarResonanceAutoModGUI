@@ -2,10 +2,7 @@
 主程序入口
 """
 
-import json
-import logging
 import time
-import threading
 import argparse
 import os
 import sys
@@ -13,7 +10,7 @@ import multiprocessing as mp
 from typing import Dict, List, Optional, Any
 from logging_config import setup_logging, get_logger
 from module_parser import ModuleParser
-from module_types import ModuleInfo, normalize_attribute_list, normalize_attribute_name, normalize_category, to_english_attr, CATEGORY_CN_TO_EN
+from module_types import normalize_attribute_list, normalize_attribute_name, normalize_category, to_english_attr, CATEGORY_CN_TO_EN, tr
 from packet_capture import PacketCapture
 from network_interface_util import get_network_interfaces, select_network_interface
 from BlueProtobuf_pb2 import CharSerialize
@@ -23,10 +20,6 @@ _is_main_process = mp.current_process().name == 'MainProcess'
 
 # 获取日志器
 logger = get_logger(__name__) if _is_main_process else None
-
-
-def _tr(lang: str, zh: str, en: str) -> str:
-    return en if (lang or '').lower() == 'en' else zh
 
 
 def get_exec_base_dir() -> str:
@@ -46,7 +39,7 @@ class StarResonanceMonitor:
                  exclude_attributes: List[str] = None, match_count: int = 1, enumeration_mode: bool = False,
                  min_attr_sum: dict | None = None, lang: str = 'zh',
                  combo_size: int = 4, compute_mode: str = 'cpu',
-                 generate_vdata: bool = False):
+                 generate_vdata: bool = False, full_enumeration_mode: bool = False):
         """
         初始化监控器
         
@@ -67,6 +60,7 @@ class StarResonanceMonitor:
         self.match_count = match_count
         self.min_attr_sum = min_attr_sum or {}
         self.enumeration_mode = enumeration_mode
+        self.full_enumeration_mode = full_enumeration_mode
         self.lang = (lang or 'zh').lower()
         self.combo_size = max(1, min(10, int(combo_size)))
         self.compute_mode = (compute_mode or 'cpu').lower()
@@ -88,53 +82,46 @@ class StarResonanceMonitor:
         
         # 统计数据
         self.stats = {
-            'total_packets': 0,
             'sync_container_packets': 0,
-            'parsed_modules': 0,
-            'players_found': 0,
             'start_time': None
         }
-        
-        # 存储解析结果
-        self.player_modules = {}  # 玩家UID -> 模组列表
-        self.module_history = []  # 模组历史记录
         
     def start_monitoring(self):
         """开始监控"""
         self.is_running = True
         self.stats['start_time'] = time.time()
         
-        logger.info(_tr(self.lang, "=== 星痕共鸣监控器启动 ===", "=== Star Resonance Monitor Started ==="))
+        logger.info(tr(self.lang, "=== 星痕共鸣监控器启动 ===", "=== Star Resonance Monitor Started ==="))
         cat_disp = self.category if self.lang != 'en' else CATEGORY_CN_TO_EN.get(self.category, self.category)
-        logger.info(_tr(self.lang, f"模组类型: {self.category}", f"Module Category: {cat_disp}"))
+        logger.info(tr(self.lang, f"模组类型: {self.category}", f"Module Category: {cat_disp}"))
         if self.attributes:
             attrs_disp = self.attributes if self.lang != 'en' else [to_english_attr(a) for a in self.attributes]
-            logger.info(_tr(self.lang, f"属性筛选: {', '.join(self.attributes)} (需要包含{self.match_count}个)", f"Attributes: {', '.join(attrs_disp)} (require {self.match_count})"))
+            logger.info(tr(self.lang, f"属性筛选: {', '.join(self.attributes)} (需要包含{self.match_count}个)", f"Attributes: {', '.join(attrs_disp)} (require {self.match_count})"))
         else:
-            logger.info(_tr(self.lang, "属性筛选: 无 (使用所有模组)", "Attributes: None (use all modules)"))
+            logger.info(tr(self.lang, "属性筛选: 无 (使用所有模组)", "Attributes: None (use all modules)"))
         if self.exclude_attributes:
             ex_disp = self.exclude_attributes if self.lang != 'en' else [to_english_attr(a) for a in self.exclude_attributes]
-            logger.info(_tr(self.lang, f"排除属性: {', '.join(self.exclude_attributes)}", f"Exclude Attributes: {', '.join(ex_disp)}"))
+            logger.info(tr(self.lang, f"排除属性: {', '.join(self.exclude_attributes)}", f"Exclude Attributes: {', '.join(ex_disp)}"))
         if self.selected_interface:
-            logger.info(_tr(self.lang, f"网络接口: {self.interface_index} - {self.selected_interface['description']}", f"Network Interface: {self.interface_index} - {self.selected_interface['description']}"))
-            logger.info(_tr(self.lang, f"接口名称: {self.selected_interface['name']}", f"Interface Name: {self.selected_interface['name']}"))
+            logger.info(tr(self.lang, f"网络接口: {self.interface_index} - {self.selected_interface['description']}", f"Network Interface: {self.interface_index} - {self.selected_interface['description']}"))
+            logger.info(tr(self.lang, f"接口名称: {self.selected_interface['name']}", f"Interface Name: {self.selected_interface['name']}"))
             addresses = [addr['addr'] for addr in self.selected_interface['addresses']]
-            logger.info(_tr(self.lang, f"接口地址: {', '.join(addresses)}", f"Interface Addresses: {', '.join(addresses)}"))
+            logger.info(tr(self.lang, f"接口地址: {', '.join(addresses)}", f"Interface Addresses: {', '.join(addresses)}"))
         else:
-            logger.info(_tr(self.lang, "网络接口: 自动", "Network Interface: Auto"))
+            logger.info(tr(self.lang, "网络接口: 自动", "Network Interface: Auto"))
         
         # 启动抓包
         self.packet_capture.start_capture(self._on_sync_container_data)
         
         
-        logger.info(_tr(self.lang, "监控已启动，等待模组数据包, 请重新登录选择角色... (解析完成后将自动退出)", "Monitoring started, waiting for module packets. Please relogin and select character... (Will exit after parsing)"))
+        logger.info(tr(self.lang, "监控已启动，等待模组数据包, 请重新登录选择角色... (解析完成后将自动退出)", "Monitoring started, waiting for module packets. Please relogin and select character... (Will exit after parsing)"))
         
     def stop_monitoring(self):
         """停止监控"""
         self.is_running = False
         self.packet_capture.stop_capture()
         
-        logger.info(_tr(self.lang, "=== 监控已停止 ===", "=== Monitoring Stopped ==="))
+        logger.info(tr(self.lang, "=== 监控已停止 ===", "=== Monitoring Stopped ==="))
         
     def _on_sync_container_data(self, data: Dict[str, Any]):
         """处理SyncContainerData数据包
@@ -155,7 +142,7 @@ class StarResonanceMonitor:
             v_data = data.get('v_data')
             if not v_data:
                 # VData 为空（非模组包），继续等待下一个包，不退出
-                logger.debug(_tr(self.lang,
+                logger.debug(tr(self.lang,
                     "收到非模组数据包，继续等待...",
                     "Received non-module packet, waiting..."))
                 return
@@ -167,15 +154,15 @@ class StarResonanceMonitor:
                     vdata_path = os.path.join(base_dir, 'modules.vdata')
                     with open(vdata_path, 'wb') as f:
                         f.write(v_data.SerializeToString())
-                    logger.info(_tr(self.lang,
+                    logger.info(tr(self.lang,
                         f"已保存模组数据到: {vdata_path}",
                         f"Saved module data to: {vdata_path}"))
                 except Exception as e:
-                    logger.warning(_tr(self.lang,
+                    logger.warning(tr(self.lang,
                         f"保存模组数据失败（不影响优化）: {e}",
                         f"Failed to save module data (optimization continues): {e}"))
             else:
-                logger.debug(_tr(self.lang,
+                logger.debug(tr(self.lang,
                     "「生成 vdata」未启用，跳过保存",
                     "generate_vdata disabled, skipping save"))
 
@@ -189,19 +176,19 @@ class StarResonanceMonitor:
                 enumeration_mode=self.enumeration_mode,
                 min_attr_sum=self.min_attr_sum,
                 combo_size=self.combo_size,
-                compute_mode=self.compute_mode
+                compute_mode=self.compute_mode,
+                full_enumeration_mode=self.full_enumeration_mode
             )
 
             # parse_module_info 正常返回 → 优化完成，刷新 stdout
-            import sys as _sys
-            _sys.stdout.flush()
-            logger.info(_tr(self.lang,
+            sys.stdout.flush()
+            logger.info(tr(self.lang,
                 "=== 优化完成，通知主线程退出 ===",
                 "=== Optimization done, signaling main thread to exit ==="))
 
         except Exception as e:
             # 修复: 原来只 log 不退出，导致 is_running 永远为 True，进程挂死
-            logger.error(_tr(self.lang,
+            logger.error(tr(self.lang,
                 f"处理SyncContainerData数据包失败: {e}",
                 f"Failed to process SyncContainerData packet: {e}"),
                 exc_info=True)
@@ -212,9 +199,7 @@ class StarResonanceMonitor:
                 self.packet_capture.stop_capture()
             except Exception:
                 pass
-            
 
-            
 
 def main():
     """主函数"""
@@ -234,7 +219,9 @@ def main():
     parser.add_argument('--min-attr-sum', '-mas', nargs=2, action='append', metavar=('ATTR','VALUE'),
                        help='强制某属性在4件套总和≥VALUE。可多次使用，如：-mas 暴击专注 8 -mas 智力加持 12')
     parser.add_argument('--enumeration-mode', '-enum', action='store_true',
-                       help='启用枚举模式, 直接使用枚举运算')
+                       help='启用枚举模式（大枚举+贪心合并取最优）')
+    parser.add_argument('--full-enumeration-mode', '-fenum', action='store_true',
+                       help='完全枚举模式（纯枚举，无贪心补充）')
     parser.add_argument('--combo-size', '-cs', type=int, default=4,
                        help='组合件数（1~10，默认4）')
     parser.add_argument('--compute-mode', '-cm', type=str, default='cpu',
@@ -274,7 +261,7 @@ def main():
         base_dir = get_exec_base_dir()
         vdata_path = os.path.join(base_dir, 'modules.vdata')
         if not os.path.exists(vdata_path):
-            logger.error(_tr(lang, f"找不到离线数据文件: {vdata_path}", f"Offline data file not found: {vdata_path}"))
+            logger.error(tr(lang, f"找不到离线数据文件: {vdata_path}", f"Offline data file not found: {vdata_path}"))
             sys.exit(1)
         try:
             with open(vdata_path, 'rb') as f:
@@ -282,7 +269,7 @@ def main():
             char_serialize = CharSerialize()
             char_serialize.ParseFromString(data_bytes)
         except Exception as e:
-            logger.error(_tr(lang, f"读取或解析离线数据失败: {e}", f"Failed to read or parse offline data: {e}"))
+            logger.error(tr(lang, f"读取或解析离线数据失败: {e}", f"Failed to read or parse offline data: {e}"))
             sys.exit(1)
 
         try:
@@ -295,10 +282,11 @@ def main():
                 enumeration_mode=args.enumeration_mode,
                 min_attr_sum=min_attr_sum,
                 combo_size=args.combo_size,
-                compute_mode=args.compute_mode
+                compute_mode=args.compute_mode,
+                full_enumeration_mode=args.full_enumeration_mode
             )
         except Exception as e:
-            logger.error(_tr(lang, f"离线计算失败: {e}", f"Offline computation failed: {e}"))
+            logger.error(tr(lang, f"离线计算失败: {e}", f"Offline computation failed: {e}"))
             sys.exit(1)
 
         sys.exit(0)
@@ -307,22 +295,22 @@ def main():
     interfaces = get_network_interfaces()
     
     if not interfaces:
-        logger.error(_tr(lang, "未找到可用的网络接口!", "No available network interfaces found!"))
+        logger.error(tr(lang, "未找到可用的网络接口!", "No available network interfaces found!"))
         return
         
     # 列出网络接口
     if args.list:
-        print(_tr(lang, "=== 可用的网络接口 ===", "=== Available Network Interfaces ==="))
+        print(tr(lang, "=== 可用的网络接口 ===", "=== Available Network Interfaces ==="))
         for i, interface in enumerate(interfaces):
             name = interface['name']
             description = interface.get('description', name)
             is_up = "✓" if interface.get('is_up', False) else "✗"
             addresses = [addr['addr'] for addr in interface['addresses']]
-            addr_str = ", ".join(addresses) if addresses else _tr(lang, "无IP地址", "No IP addresses")
+            addr_str = ", ".join(addresses) if addresses else tr(lang, "无IP地址", "No IP addresses")
             
             print(f"  {i:2d}. {is_up} {description}")
-            print(_tr(lang, f"      地址: {addr_str}", f"      Addresses: {addr_str}"))
-            print(_tr(lang, f"      名称: {name}", f"      Name: {name}"))
+            print(tr(lang, f"      地址: {addr_str}", f"      Addresses: {addr_str}"))
+            print(tr(lang, f"      名称: {name}", f"      Name: {name}"))
             print()
         return
         
@@ -343,17 +331,17 @@ def main():
             for i, iface in enumerate(interfaces):
                 if iface.get('is_up', False):
                     interface_index = i
-                    logger.info(_tr(lang,
+                    logger.info(tr(lang,
                         f"自动检测未找到默认路由，使用第一个活动接口: {i} - {iface.get('description', iface['name'])}",
                         f"Auto-detect fallback to first active interface: {i} - {iface.get('description', iface['name'])}"))
                     break
 
         if interface_index is None:
-            logger.error(_tr(lang, "未找到可用的网络接口!", "No available network interface found!"))
+            logger.error(tr(lang, "未找到可用的网络接口!", "No available network interface found!"))
             sys.exit(1)
         else:
             iface_desc = interfaces[interface_index].get('description', interfaces[interface_index]['name'])
-            print(_tr(lang,
+            print(tr(lang,
                 f"使用网络接口: {interface_index} - {iface_desc}",
                 f"Using network interface: {interface_index} - {iface_desc}"))
 
@@ -362,28 +350,26 @@ def main():
         if 0 <= args.interface < len(interfaces):
             interface_index = args.interface
         else:
-            logger.error(_tr(lang,
+            logger.error(tr(lang,
                 f"无效的接口索引: {args.interface}（共 {len(interfaces)} 个接口）",
                 f"Invalid interface index: {args.interface} (total {len(interfaces)} interfaces)"))
             sys.exit(1)
     else:
         # 交互式选择（仅用于命令行直接运行，GUI 永远不走这里）
-        print(_tr(lang, "星痕共鸣模组筛选器!", "Star Resonance Module Filter!"))
-        print(_tr(lang, "版本: V1.6.5", "Version: V1.6.5"))
+        print(tr(lang, "星痕共鸣模组筛选器!", "Star Resonance Module Filter!"))
+        print(tr(lang, "版本: V1.6.5", "Version: V1.6.5"))
         print("GitHub: https://github.com/fudiyangjin/StarResonanceAutoMod")
         print()
         try:
             interface_index = select_network_interface(interfaces)
         except (EOFError, KeyboardInterrupt):
-            logger.error(_tr(lang, "未选择网络接口!", "No network interface selected!"))
+            logger.error(tr(lang, "未选择网络接口!", "No network interface selected!"))
             sys.exit(1)
         if interface_index is None:
-            logger.error(_tr(lang, "未选择网络接口!", "No network interface selected!"))
+            logger.error(tr(lang, "未选择网络接口!", "No network interface selected!"))
             sys.exit(1)
 
     # 创建监控器
-    # generate_vdata 仅在在线模式有意义；若用户误在 --load-vdata 时传入，强制忽略
-    effective_generate_vdata = getattr(args, 'generate_vdata', False) and not args.load_vdata
     monitor = StarResonanceMonitor(
         interface_index=interface_index,
         category=category_cn,
@@ -395,7 +381,8 @@ def main():
         lang=lang,
         combo_size=args.combo_size,
         compute_mode=args.compute_mode,
-        generate_vdata=effective_generate_vdata
+        generate_vdata=args.generate_vdata,
+        full_enumeration_mode=args.full_enumeration_mode
     )
     
     try:
@@ -403,7 +390,7 @@ def main():
         monitor.start_monitoring()
 
         # 等待模组解析完成
-        logger.info(_tr(lang,
+        logger.info(tr(lang,
             "等待模组数据包... (解析完成后将自动退出)",
             "Waiting for module packets... (Will exit after parsing)"))
 
@@ -415,14 +402,14 @@ def main():
             _waited += 0.1
 
         if _waited >= _MAX_WAIT:
-            logger.warning(_tr(lang,
+            logger.warning(tr(lang,
                 "等待超时（60分钟），强制退出",
                 "Wait timeout (60min), force exit"))
 
     except KeyboardInterrupt:
-        logger.info(_tr(lang, "收到停止信号", "Received stop signal"))
+        logger.info(tr(lang, "收到停止信号", "Received stop signal"))
     except Exception as e:
-        logger.error(_tr(lang, f"在线监控异常: {e}", f"Online monitoring error: {e}"), exc_info=True)
+        logger.error(tr(lang, f"在线监控异常: {e}", f"Online monitoring error: {e}"), exc_info=True)
     finally:
         if monitor.is_running:
             monitor.stop_monitoring()

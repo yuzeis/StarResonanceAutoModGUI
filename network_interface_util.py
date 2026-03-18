@@ -6,8 +6,7 @@
 import subprocess
 import socket
 import psutil
-import logging
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 from logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -73,30 +72,29 @@ def find_default_network_interface(interfaces: List[Dict]) -> Optional[int]:
         默认接口的索引, 如果未找到则返回None
     """
     try:
-        if hasattr(subprocess, 'run'):
-            result = subprocess.run(
-                ['route', 'print', '0.0.0.0'], 
-                capture_output=True, 
-                text=True, 
-                timeout=10
-            )
-            
-            if result.returncode == 0:
-                lines = result.stdout.split('\n')
-                for line in lines:
-                    line = line.strip()
-                    if line.startswith('0.0.0.0'):
-                        parts = line.split()
-                        # route print 格式: Network  Netmask  Gateway  Interface  Metric
-                        # parts[0]=Network parts[1]=Netmask parts[2]=Gateway parts[3]=Interface
-                        if len(parts) >= 5:
-                            interface_addr = parts[3]
-                            
-                            # 查找拥有该 IP 地址的接口
-                            for i, interface in enumerate(interfaces):
-                                for addr_info in interface['addresses']:
-                                    if addr_info['addr'] == interface_addr:
-                                        return i
+        result = subprocess.run(
+            ['route', 'print', '0.0.0.0'], 
+            capture_output=True, 
+            text=True, 
+            timeout=10
+        )
+        
+        if result.returncode == 0:
+            lines = result.stdout.split('\n')
+            for line in lines:
+                line = line.strip()
+                if line.startswith('0.0.0.0'):
+                    parts = line.split()
+                    # route print 格式: Network  Netmask  Gateway  Interface  Metric
+                    # parts[0]=Network parts[1]=Netmask parts[2]=Gateway parts[3]=Interface
+                    if len(parts) >= 5:
+                        interface_addr = parts[3]
+                        
+                        # 查找拥有该 IP 地址的接口
+                        for i, interface in enumerate(interfaces):
+                            for addr_info in interface['addresses']:
+                                if addr_info['addr'] == interface_addr:
+                                    return i
                                         
     except Exception as e:
         logger.debug(f"查找默认网络接口失败: {e}")

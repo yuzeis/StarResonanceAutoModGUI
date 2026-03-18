@@ -460,6 +460,24 @@ extern "C" int GpuStrategyEnumeration(
     long long *d_comp_indices=nullptr;
     cudaError_t err = cudaSuccess;
 
+    // 统一清理所有 GPU 缓冲区（正常退出和 cleanup 共用）
+    auto free_all = [&]() {
+        if (d_attr_ids)       cudaFree(d_attr_ids);
+        if (d_attr_values)    cudaFree(d_attr_values);
+        if (d_attr_counts)    cudaFree(d_attr_counts);
+        if (d_offsets)        cudaFree(d_offsets);
+        if (d_target_attrs)   cudaFree(d_target_attrs);
+        if (d_exclude_attrs)  cudaFree(d_exclude_attrs);
+        if (d_min_attr_ids)   cudaFree(d_min_attr_ids);
+        if (d_min_attr_values)cudaFree(d_min_attr_values);
+        if (d_scores)         cudaFree(d_scores);
+        if (d_indices)        cudaFree(d_indices);
+        if (d_flags)          cudaFree(d_flags);
+        if (d_out_count)      cudaFree(d_out_count);
+        if (d_comp_scores)    cudaFree(d_comp_scores);
+        if (d_comp_indices)   cudaFree(d_comp_indices);
+    };
+
 #define CUDA_CHECK(call, msg) do { err=(call); if(err!=cudaSuccess){printf("ERROR: %s: %s\n",(msg),cudaGetErrorString(err));goto cleanup;} } while(0)
 
     CUDA_CHECK(cudaMalloc(&d_attr_ids,    total_attrs   * sizeof(int)), "malloc attr_ids");
@@ -582,47 +600,11 @@ extern "C" int GpuStrategyEnumeration(
         }
         // 返回实际结果数（与 OpenCL 一致，非固定 max_solutions）
         int final_count = out_n;
-
-        // 统一清理所有 GPU 缓冲区（消除重复代码）
-        auto free_all = [&]() {
-            if (d_attr_ids)       cudaFree(d_attr_ids);
-            if (d_attr_values)    cudaFree(d_attr_values);
-            if (d_attr_counts)    cudaFree(d_attr_counts);
-            if (d_offsets)        cudaFree(d_offsets);
-            if (d_target_attrs)   cudaFree(d_target_attrs);
-            if (d_exclude_attrs)  cudaFree(d_exclude_attrs);
-            if (d_min_attr_ids)   cudaFree(d_min_attr_ids);
-            if (d_min_attr_values)cudaFree(d_min_attr_values);
-            if (d_scores)         cudaFree(d_scores);
-            if (d_indices)        cudaFree(d_indices);
-            if (d_flags)          cudaFree(d_flags);
-            if (d_out_count)      cudaFree(d_out_count);
-            if (d_comp_scores)    cudaFree(d_comp_scores);
-            if (d_comp_indices)   cudaFree(d_comp_indices);
-        };
         free_all();
         return final_count;
     }
 
 cleanup:
-    {
-        auto free_all = [&]() {
-            if (d_attr_ids)       cudaFree(d_attr_ids);
-            if (d_attr_values)    cudaFree(d_attr_values);
-            if (d_attr_counts)    cudaFree(d_attr_counts);
-            if (d_offsets)        cudaFree(d_offsets);
-            if (d_target_attrs)   cudaFree(d_target_attrs);
-            if (d_exclude_attrs)  cudaFree(d_exclude_attrs);
-            if (d_min_attr_ids)   cudaFree(d_min_attr_ids);
-            if (d_min_attr_values)cudaFree(d_min_attr_values);
-            if (d_scores)         cudaFree(d_scores);
-            if (d_indices)        cudaFree(d_indices);
-            if (d_flags)          cudaFree(d_flags);
-            if (d_out_count)      cudaFree(d_out_count);
-            if (d_comp_scores)    cudaFree(d_comp_scores);
-            if (d_comp_indices)   cudaFree(d_comp_indices);
-        };
-        free_all();
-    }
+    free_all();
     return 0;
 }

@@ -9,7 +9,6 @@ import time
 import math
 import threading
 import logging
-import random
 from typing import List, Optional, Dict
 
 _PROJ_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -20,7 +19,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QLabel, QPushButton, QComboBox, QSpinBox, QCheckBox, QTextEdit,
     QScrollArea, QSplitter, QProgressBar,
-    QGridLayout, QGroupBox, QSizePolicy, QTabWidget,
+    QGridLayout, QGroupBox, QTabWidget,
     QTableWidget, QTableWidgetItem, QHeaderView,
     QDialog, QAbstractItemView,
 )
@@ -56,6 +55,9 @@ from config_codec import (
     encode_config as _encode_config,
     decode_config as _decode_config,
 )
+
+# 模块级常量：避免在循环/回调中重复构造 set(SPECIAL_ATTRS)
+_SPECIAL_ATTRS_SET: frozenset = frozenset(SPECIAL_ATTRS)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -351,7 +353,7 @@ class MinAttrSumWidget(QWidget):
 
         cols = 2
         for i, (attr, val) in enumerate(self._constraints.items()):
-            is_sp = attr in set(SPECIAL_ATTRS)
+            is_sp = attr in _SPECIAL_ATTRS_SET
             tag_clr = ACCENT if is_sp else SUCCESS
             tag_bg  = ACCENT_DIM if is_sp else "#003322"
             tag_bdr = ACCENT2 if is_sp else "#006644"
@@ -729,6 +731,12 @@ class MonitorWorker(QThread):
     def stop(self): self._stop.set()
 
     def run(self):
+        import subprocess
+        import queue as _queue
+        import locale as _locale
+        import re as _re
+        import threading as _th
+
         cfg = self._cfg
         self.log_signal.emit(f"[INFO] 启动监控器")
         self.log_signal.emit(
@@ -739,8 +747,10 @@ class MonitorWorker(QThread):
             self.log_signal.emit(f"[INFO] 包含属性: {', '.join(cfg['attributes'])}")
         if cfg.get("exclude_attributes"):
             self.log_signal.emit(f"[INFO] 排除属性: {', '.join(cfg['exclude_attributes'])}")
-        if cfg.get("enumeration_mode"):
-            self.log_signal.emit("[INFO] 枚举模式已启用")
+        if cfg.get("full_enumeration_mode"):
+            self.log_signal.emit("[INFO] 完全枚举模式已启用（纯枚举）")
+        elif cfg.get("enumeration_mode"):
+            self.log_signal.emit("[INFO] 枚举模式已启用（枚举+贪心）")
         if cfg.get("load_vdata"):
             self.log_signal.emit("[INFO] 离线模式：从 modules.vdata 读取")
         else:
@@ -748,24 +758,24 @@ class MonitorWorker(QThread):
             if cfg.get("generate_vdata"):
                 self.log_signal.emit("[INFO] ✦ 已启用「生成 vdata」—— 抓包成功后将保存 modules.vdata")
 
-        import subprocess, sys as _sys, os as _os, re as _re
         # 构建 CLI 参数
         # ── 区分编译环境与开发环境 ──────────────────────────────────────────
         # PyInstaller 打包后 sys.executable 指向 .exe 本身，不能再用它来"运行 .py"。
         # 此时改为：exe --run-monitor <args>，入口点会拦截该标志并调用监控器。
         # 开发环境（直接 python gui_main.py）则保持原有行为：python star_railway_monitor.py
-        if getattr(_sys, 'frozen', False):
-            cli = [_sys.executable, "--run-monitor"]
+        if getattr(sys, 'frozen', False):
+            cli = [sys.executable, "--run-monitor"]
         else:
-            cli = [_sys.executable,
-                   _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "star_railway_monitor.py")]
+            cli = [sys.executable,
+                   os.path.join(os.path.dirname(os.path.abspath(__file__)), "star_railway_monitor.py")]
         cli += ["-a"] if cfg.get("auto_interface") else ["-i", str(cfg.get("interface_index",0))]
         if cfg.get("load_vdata"):       cli.append("-lv")            # --load-vdata
         # 生成 vdata：仅在线模式（非 load_vdata）且用户勾选时才传入
         # 双重保险：get_config() 已在离线时强制 False，此处再次校验
         if cfg.get("generate_vdata") and not cfg.get("load_vdata"):
             cli.append("-gv")                                        # --generate-vdata
-        if cfg.get("enumeration_mode"): cli.append("-enum")          # --enumeration-mode
+        if cfg.get("full_enumeration_mode"): cli.append("-fenum")        # --full-enumeration-mode
+        elif cfg.get("enumeration_mode"): cli.append("-enum")          # --enumeration-mode
         if cfg.get("debug"):            cli.append("-d")             # --debug
         cat = cfg.get("category","全部")
         if cat != "全部":               cli += ["-c", cat]           # --category
@@ -775,10 +785,10 @@ class MonitorWorker(QThread):
         if excl:                        cli += ["-exattr"] + excl    # --exclude-attributes
         mc = cfg.get("match_count", 1)
         cli += ["-mc", str(mc)]                                      # --match-count
-        # 组合件数（修复问题2：combo_size 1-10 现在真正生效）
+        # 组合件数
         cs = cfg.get("combo_size", 4)
         cli += ["-cs", str(cs)]                                      # --combo-size
-        # 计算模式（修复问题1：计算模式选择现在真正生效）
+        # 计算模式
         compute_mode = cfg.get("mode", "cpu")
         cli += ["-cm", compute_mode]                                 # --compute-mode
         mas = cfg.get("min_attr_sum",{})
@@ -787,8 +797,6 @@ class MonitorWorker(QThread):
                 cli += ["-mas", k, str(v)]                           # --min-attr-sum
 
         self.log_signal.emit(f"[INFO] 执行: {' '.join(cli)}")
-
-        import subprocess, sys as _sys, os as _os, re as _re, queue as _queue, locale as _locale
 
         # Windows 下子进程控制台输出编码通常是系统代码页（GBK/CP936），
         # 用 locale.getpreferredencoding() 自动取，fallback 到 utf-8
@@ -801,7 +809,7 @@ class MonitorWorker(QThread):
                 text=True, encoding=_enc, errors="replace",
                 bufsize=1,
                 # Windows 下用 CREATE_NO_WINDOW 隐藏黑框
-                creationflags=subprocess.CREATE_NO_WINDOW if _sys.platform == "win32" else 0,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
             )
         except FileNotFoundError:
             self.log_signal.emit("[WARN] 未找到 star_railway_monitor.py，进入演示模式")
@@ -830,16 +838,13 @@ class MonitorWorker(QThread):
             finally:
                 line_q.put(None)   # 哨兵：结束标记
 
-        import threading as _th
         _th.Thread(target=_reader, daemon=True).start()
 
         # ── 解析状态机 ────────────────────────────────────────
-        results       = []
-        cur           = None
-        in_modules    = False
-        in_attrs      = False
-        total_lines   = 0
-        progress_step = 0
+        results    = []
+        cur        = None
+        in_modules = False
+        in_attrs   = False
 
         def _flush_cur():
             nonlocal cur
@@ -878,7 +883,6 @@ class MonitorWorker(QThread):
                 break   # 读取线程结束
 
             line = raw.rstrip()
-            total_lines += 1
 
             # ── 只把关键节点打到 GUI 日志，其余静默 ──────────
             _key = (line.startswith("===") or
@@ -889,13 +893,12 @@ class MonitorWorker(QThread):
                 self.log_signal.emit(f"[INFO] {line}" if not line.startswith("[") else line)
 
             # ── 解析模组总数 N（用于主界面动态预估 C(N,k)）──
-            import re as _re2
-            _mc = (_re2.search(r"共\s*(\d+)\s*个模组", line) or
-                   _re2.search(r"模组总数[：:]\s*(\d+)", line) or
-                   _re2.search(r"找到\s*(\d+)\s*个模组", line) or
-                   _re2.search(r"加载.*?(\d+)\s*个模组", line) or
-                   _re2.search(r"扫描.*?(\d+)\s*个模组", line) or
-                   _re2.search(r"(\d+)\s*modules?\s+loaded", line, _re2.IGNORECASE))
+            _mc = (_re.search(r"共\s*(\d+)\s*个模组", line) or
+                   _re.search(r"模组总数[：:]\s*(\d+)", line) or
+                   _re.search(r"找到\s*(\d+)\s*个模组", line) or
+                   _re.search(r"加载.*?(\d+)\s*个模组", line) or
+                   _re.search(r"扫描.*?(\d+)\s*个模组", line) or
+                   _re.search(r"(\d+)\s*modules?\s+loaded", line, _re.IGNORECASE))
             if _mc:
                 self.module_count_signal.emit(int(_mc.group(1)))
 
@@ -1105,10 +1108,16 @@ class ConfigPanel(QWidget):
             lambda v: self.lbl_combo_hint.setText(f"C(N, {v}) 件套搭配"))
 
         adv.addWidget(lbl("枚举模式"),2,0)
-        self.chk_enum=QCheckBox("启用（推荐配合属性筛选）"); adv.addWidget(self.chk_enum,2,1,1,2)
+        self.chk_enum=QCheckBox("大枚举+贪心"); adv.addWidget(self.chk_enum,2,1,1,2)
 
-        adv.addWidget(lbl("调试日志"),3,0)
-        self.chk_debug=QCheckBox("启用详细日志输出"); adv.addWidget(self.chk_debug,3,1,1,2)
+        adv.addWidget(lbl("完全枚举"),3,0)
+        self.chk_full_enum=QCheckBox("纯枚举"); adv.addWidget(self.chk_full_enum,3,1,1,2)
+        # 互斥：勾选完全枚举时自动取消枚举+贪心，反之亦然
+        self.chk_enum.stateChanged.connect(lambda s: self.chk_full_enum.setChecked(False) if int(s)==2 else None)
+        self.chk_full_enum.stateChanged.connect(lambda s: self.chk_enum.setChecked(False) if int(s)==2 else None)
+
+        adv.addWidget(lbl("调试日志"),4,0)
+        self.chk_debug=QCheckBox("启用详细日志输出"); adv.addWidget(self.chk_debug,4,1,1,2)
         adv.setColumnStretch(2,1)
         lay.addWidget(g5)
 
@@ -1191,6 +1200,7 @@ class ConfigPanel(QWidget):
         self.spin_mc.setValue(int(cfg.get("match_count", 1)))
         self.spin_combo.setValue(int(cfg.get("combo_size", 4)))
         self.chk_enum.setChecked(bool(cfg.get("enumeration_mode", False)))
+        self.chk_full_enum.setChecked(bool(cfg.get("full_enumeration_mode", False)))
         self.chk_debug.setChecked(bool(cfg.get("debug", False)))
         self.mas_widget.set_constraints(cfg.get("min_attr_sum", {}))
         self.remark_edit.setPlainText(cfg.get("remark", ""))
@@ -1259,6 +1269,7 @@ class ConfigPanel(QWidget):
             "match_count":        self.spin_mc.value(),
             "combo_size":         self.spin_combo.value(),
             "enumeration_mode":   self.chk_enum.isChecked(),
+            "full_enumeration_mode": self.chk_full_enum.isChecked(),
             "debug":              self.chk_debug.isChecked(),
             "min_attr_sum":       self.mas_widget.get_constraints(),
             "remark":             self.remark_edit.toPlainText(),
@@ -1378,7 +1389,7 @@ class OutputPanel(QWidget):
         def _chip_style(aname: str):
             """词条chip样式：仅用户选中的属性才高亮（极系蓝色 / 普通绿色），未选中一律灰色"""
             if aname in HL_ATTRS:
-                if aname in set(SPECIAL_ATTRS):
+                if aname in _SPECIAL_ATTRS_SET:
                     return ACCENT_DIM, ACCENT, ACCENT2   # 用户选中的极系词条 → 青色
                 return "#003322", SUCCESS, "#00aa66"     # 用户选中的普通词条 → 绿色
             return BG2, TEXT2, BORDER                    # 未选中 → 灰色，不论是否为极系
@@ -1481,7 +1492,7 @@ class OutputPanel(QWidget):
             sum_lay.addWidget(sum_hdr)
 
             for aname, total in attr_sum.items():
-                is_sp = aname in set(SPECIAL_ATTRS)
+                is_sp = aname in _SPECIAL_ATTRS_SET
                 is_hl = aname in HL_ATTRS
                 if is_hl and is_sp:
                     bar_clr, txt_clr = ACCENT, ACCENT    # 用户选中的极系词条 → 青色
@@ -1686,7 +1697,7 @@ class TitleBar(QWidget):
         title=QLabel("星痕共鸣  模组筛选器")
         title.setStyleSheet(f"color:{TEXT};font-size:16px;font-weight:700;letter-spacing:2px;")
         lay.addWidget(title)
-        ver=QLabel("v1.6.5")
+        ver=QLabel("v1.5-a")
         ver.setStyleSheet(
             f"color:{TEXT3};font-size:11px;background:{BG3};"
             f"border:1px solid {BORDER};border-radius:3px;padding:1px 6px;")

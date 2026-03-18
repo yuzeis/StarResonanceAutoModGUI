@@ -69,17 +69,6 @@ PYBIND11_MODULE(module_optimizer_cpp, m) {
         py::arg("max_workers")              = 8,
         py::arg("combo_size")               = 4);
 
-    // ── 自动选择最优后端：CUDA > OpenCL > CPU（支持 combo_size 1~10）
-    m.def("strategy_enumeration_gpu_cpp", &ModuleOptimizerCpp::StrategyEnumerationGPU,
-        "自动选择最优后端(CUDA>OpenCL>CPU)，支持combo_size 1~10",
-        py::arg("modules"),
-        py::arg("target_attributes")        = std::unordered_set<int>{},
-        py::arg("exclude_attributes")       = std::unordered_set<int>{},
-        py::arg("min_attr_sum_requirements")= std::unordered_map<int,int>{},
-        py::arg("max_solutions")            = 60,
-        py::arg("max_workers")              = 8,
-        py::arg("combo_size")               = 4);
-
     m.def("optimize_modules_cpp", &ModuleOptimizerCpp::OptimizeModules,
         "贪心+局部搜索",
         py::arg("modules"),

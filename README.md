@@ -9,8 +9,8 @@ StarResonanceAutoModGUI 是基于开源项目 [StarResonanceAutoMod](https://git
 ## 项目信息
 
 - 项目名称：StarResonanceAutoModGUI
-- 当前版本：v1.2-alpha
-- 版本代号：Wiederdämmerung
+- 当前版本：v1.5-alpha
+- 版本代号：Sonnenschein
 - 原项目名称：StarResonanceAutoMod
 - 原项目作者：fudiyangjin
 - 原项目地址：https://github.com/fudiyangjin/StarResonanceAutoMod
@@ -89,7 +89,7 @@ python gui_main.py
 
 当前发布版本为：
 
-**v1.2-alpha / Wiederdämmerung**
+**v1.5-alpha / Sonnenschein**
 
 这是一个早期 alpha 版本，可能仍存在：
 

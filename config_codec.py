@@ -12,8 +12,6 @@ config_codec — 配置码编解码模块
 
 import json
 import base64
-import struct
-import io
 
 # ═══════════════════════════════════════════════════════════
 #  属性 / 类型数据（GUI 和编解码共用）
@@ -37,7 +35,8 @@ CFG_DEFAULTS: dict = {
     "auto_interface": True, "interface_index": 0, "load_vdata": False,
     "generate_vdata": False, "category": "全部", "attributes": [],
     "exclude_attributes": [], "match_count": 1, "combo_size": 4,
-    "enumeration_mode": False, "debug": False, "min_attr_sum": {}, "remark": "",
+    "enumeration_mode": False, "full_enumeration_mode": False,
+    "debug": False, "min_attr_sum": {}, "remark": "",
 }
 
 # ═══════════════════════════════════════════════════════════
@@ -101,9 +100,9 @@ class _BitReader:
 #  编码（当前版本 Z7: 比特流差分）
 # ═══════════════════════════════════════════════════════════
 def encode_config(cfg: dict) -> str:
-    """配置 → 配置码（Z7: 前缀）
+    """配置 → 配置码（Z8: 前缀）
     流程: 比特流差分编码 → base85
-    · 12-bit presence mask 标记哪些字段与默认值不同
+    · 16-bit presence mask 标记哪些字段与默认值不同
     · 布尔字段仅靠 presence bit 隐含（出现=取反），0 额外比特
     · attributes / exclude_attributes → 21-bit bitmask（仅非空时写入）
     · match_count / combo_size → 4 bit（范围 1-16）
@@ -112,7 +111,7 @@ def encode_config(cfg: dict) -> str:
     """
     bw = _BitWriter()
 
-    # ── presence mask (12 bits) ──────────────────────
+    # ── presence mask (16 bits) ──────────────────────
     presence = 0
     if cfg.get("auto_interface", True)    != True:   presence |= (1 << 0)
     if cfg.get("interface_index", 0)      != 0:      presence |= (1 << 1)
@@ -126,7 +125,8 @@ def encode_config(cfg: dict) -> str:
     if cfg.get("enumeration_mode", False) != False:  presence |= (1 << 9)
     if cfg.get("debug", False)            != False:  presence |= (1 << 10)
     if cfg.get("min_attr_sum", {}):                  presence |= (1 << 11)
-    bw.write(presence, 12)
+    if cfg.get("full_enumeration_mode", False) != False: presence |= (1 << 12)
+    bw.write(presence, 16)
 
     # ── 各字段数据（仅非默认）───────────────────────
     if presence & (1 << 1):
@@ -161,7 +161,7 @@ def encode_config(cfg: dict) -> str:
     remark = cfg.get("remark", "")
     if remark:
         raw += remark.encode('utf-8')
-    return "Z7:" + base64.b85encode(raw).decode('ascii')
+    return "Z8:" + base64.b85encode(raw).decode('ascii')
 
 
 # ═══════════════════════════════════════════════════════════
@@ -170,18 +170,18 @@ def encode_config(cfg: dict) -> str:
 def decode_config(code: str) -> dict:
     """配置码 → 配置字典，兼容所有历史格式"""
 
-    # ── Z7: 比特流差分格式（当前版本）──────────────
-    if code.startswith("Z7:"):
-        raw = base64.b85decode(code[3:].encode('ascii'))
+    # ── Z8/Z7 共用解码逻辑 ────────────────────────────
+    def _decode_bitstream(raw: bytes, presence_bits: int) -> dict:
         cfg = dict(CFG_DEFAULTS)
         br = _BitReader(raw)
-        presence = br.read(12)
+        presence = br.read(presence_bits)
 
         if presence & (1 << 0):  cfg["auto_interface"] = False
         if presence & (1 << 2):  cfg["load_vdata"] = True
         if presence & (1 << 3):  cfg["generate_vdata"] = True
         if presence & (1 << 9):  cfg["enumeration_mode"] = True
         if presence & (1 << 10): cfg["debug"] = True
+        if presence & (1 << 12): cfg["full_enumeration_mode"] = True
 
         if presence & (1 << 1):
             cfg["interface_index"] = br.read(8)
@@ -210,6 +210,16 @@ def decode_config(code: str) -> dict:
         if consumed < len(raw):
             cfg["remark"] = raw[consumed:].decode('utf-8')
         return cfg
+
+    # ── Z8: 16-bit presence（当前版本）────────────────
+    if code.startswith("Z8:"):
+        raw = base64.b85decode(code[3:].encode('ascii'))
+        return _decode_bitstream(raw, 16)
+
+    # ── Z7: 12-bit presence（旧版兼容）────────────────
+    if code.startswith("Z7:"):
+        raw = base64.b85decode(code[3:].encode('ascii'))
+        return _decode_bitstream(raw, 12)
 
     # ── Z4: JSON + zstd + base85（旧版兼容）────────
     if code.startswith("Z4:"):

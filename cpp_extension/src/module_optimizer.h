@@ -58,7 +58,43 @@ namespace Constants {
         471, 477, 483, 489, 495, 500, 506, 512, 518, 524, 530, 535, 541, 547, 553, 559, 565, 570, 576, 582,
         588, 594, 599, 605, 611, 617, 623, 629, 634, 640, 646, 652, 658, 664, 669, 675, 681, 687, 693, 699
     };
+
+    /// @brief 快速判断属性ID是否为特殊属性（替代 unordered_map 查找）
+    /// @details 编译器会优化为跳转表或范围检查，0 内存访问
+    inline bool IsSpecialAttr(int id) {
+        switch (id) {
+            case 2104: case 2105: case 2204: case 2205:
+            case 2304: case 2404: case 2405: case 2406:
+                return true;
+            default: return false;
+        }
+    }
 }
+
+/// @brief 属性ID位图，用于热路径中替代 unordered_set<int> 的 O(1) 查找
+/// @details 属性ID范围 1110~2406，直接用 bool[2500] 索引。
+///          2.5KB 完全在 L1 cache 中。构造一次，查询数十亿次。
+struct AttrBitmap {
+    static constexpr int CAPACITY = 2500;
+    bool bits[CAPACITY];
+    bool has_any;  ///< 快速判空，避免空集时的数组访问
+
+    AttrBitmap() : bits{}, has_any(false) {}
+
+    void set(int id) {
+        if (id >= 0 && id < CAPACITY) { bits[id] = true; has_any = true; }
+    }
+    bool contains(int id) const {
+        return has_any && id >= 0 && id < CAPACITY && bits[id];
+    }
+
+    /// @brief 从 unordered_set 构造
+    static AttrBitmap from_set(const std::unordered_set<int>& s) {
+        AttrBitmap bm;
+        for (int id : s) bm.set(id);
+        return bm;
+    }
+};
 
 /// @brief 计算组合数 C(n,r)
 /// @param n 总元素数量
@@ -257,21 +293,6 @@ public:
         const std::unordered_set<int>& target_attributes = {},
         const std::unordered_set<int>& exclude_attributes = {});
 
-    /// @brief 根据紧凑索引计算战斗力（仅支持 combo_size <= 4，超过4件请用 CalculateCombatPowerByIndices）
-    /// @param packed_indices 打包的模组索引（每16bit一个，最多4个）
-    /// @param modules 模组信息列表
-    /// @param target_attributes 目标属性名称列表
-    /// @param exclude_attributes 排除属性名称列表
-    /// @param combo_size 实际件数（<=4），默认4
-    /// @return 返回战斗力数值
-    static int CalculateCombatPowerByPackedIndices(
-        uint64_t packed_indices,
-        const std::vector<ModuleInfo>& modules,
-        const std::unordered_set<int>& target_attributes = {},
-        const std::unordered_set<int>& exclude_attributes = {},
-        int combo_size = 4
-    );
-
     /// @brief 处理组合范围（支持combo_size 1~10）
     static std::vector<CompactSolution> ProcessCombinationRange(
         size_t start_combination, 
@@ -349,8 +370,55 @@ public:
         int local_search_iterations = 30,
         int combo_size = 4);
 
+    /// @brief GPU 数据扁平化结构（CUDA/OpenCL 共用）
+    struct FlatModuleData {
+        std::vector<int> attr_ids, attr_values, attr_counts, offsets;
+        std::vector<int> target_vec, exclude_vec, min_ids, min_values;
+    };
+
+    /// @brief 将模组数据扁平化为 GPU 可用的数组格式
+    static FlatModuleData FlattenModulesForGpu(
+        const std::vector<ModuleInfo>& modules,
+        const std::unordered_set<int>& target_attributes,
+        const std::unordered_set<int>& exclude_attributes,
+        const std::unordered_map<int, int>& min_attr_sum_requirements);
+
+    /// @brief 将 GPU 返回的打包索引解包为 ModuleSolution（CUDA/OpenCL 共用）
+    static std::vector<ModuleSolution> UnpackGpuSolutions(
+        const std::vector<int>& gpu_scores,
+        const std::vector<long long>& gpu_indices,
+        int gpu_result_count,
+        int combo_size,
+        int slots_per_sol,
+        const std::vector<ModuleInfo>& modules,
+        const std::unordered_set<int>& target_attributes,
+        const std::unordered_set<int>& exclude_attributes,
+        const char* backend_name);
+
 private:
-    /// @brief 贪心构造解决方案
+    /// @brief 位图版评分（热路径专用，避免 unordered_set 哈希开销）
+    static int ScoreByIndicesBitmap(
+        const std::vector<size_t>& indices,
+        const std::vector<ModuleInfo>& modules,
+        const AttrBitmap& target_bm,
+        const AttrBitmap& exclude_bm);
+
+    /// @brief 贪心构造（位图版）
+    static LightweightSolution GreedyConstructBitmap(
+        const std::vector<ModuleInfo>& modules,
+        const AttrBitmap& target_bm,
+        const AttrBitmap& exclude_bm,
+        int combo_size);
+
+    /// @brief 局部搜索（位图版）
+    static LightweightSolution LocalSearchBitmap(
+        const LightweightSolution& solution,
+        const std::vector<ModuleInfo>& all_modules,
+        int iterations,
+        const AttrBitmap& target_bm,
+        const AttrBitmap& exclude_bm);
+
+    /// @brief 贪心构造解决方案（保留兼容，内部转 bitmap 委托）
     /// @param modules 模组信息列表
     /// @param target_attributes 目标属性名称集合
     /// @param exclude_attributes 排除属性名称集合
